@@ -1,0 +1,77 @@
+# Vela configuration file
+# Copy this to config.toml and edit to match your services.
+# Run: vela config.toml
+
+[global]
+# Port for Vela's REST API. Default: 7700.
+api_port = 7700
+
+# A strong secret key. Any API request without this in the
+# Authorization header (Bearer <key>) will be rejected.
+# Generate one with: openssl rand -hex 32
+api_key = "change-me-to-a-strong-secret"
+
+# Directory for Vela log files.
+log_dir = "/var/log/vela"
+
+# ─── Service definitions ────────────────────────────────────────────────────
+# Add one [[services]] block per service you want Vela to monitor.
+
+[[services]]
+# Unique ID — lowercase letters, numbers, hyphens only.
+id = "auth-service"
+name = "Authentication Service"
+host = "127.0.0.1"
+port = 3001
+
+# Command to restart this service if it fails.
+# Comment out if Vela should monitor-only (no auto-restart).
+command = "systemctl restart auth-service"
+
+# How often to run the health check (seconds).
+check_interval_secs = 10
+
+# How many consecutive failures before marking as Failed.
+failure_threshold = 3
+
+# Maximum restart attempts before Vela stops trying.
+max_restarts = 5
+
+[services.health_check]
+kind = "http"
+http_path = "/health"
+timeout_ms = 3000
+
+[services.proxy]
+# Vela listens on this port and forwards traffic to host:port above.
+listen_port = 8001
+
+[[services.alerts]]
+kind = "webhook"
+endpoint = "https://your-webhook-url.example.com/alerts"
+enabled = true
+
+[[services.alerts]]
+kind = "log"
+enabled = true
+
+# ─── Second service example ─────────────────────────────────────────────────
+
+[[services]]
+id = "payment-service"
+name = "Payment Service"
+host = "127.0.0.1"
+port = 3002
+command = "systemctl restart payment-service"
+check_interval_secs = 15
+failure_threshold = 2
+max_restarts = 3
+
+[services.health_check]
+# TCP check — just verifies the port accepts connections.
+kind = "tcp"
+timeout_ms = 2000
+
+[[services.alerts]]
+kind = "log"
+enabled = true

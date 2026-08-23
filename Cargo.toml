@@ -1,0 +1,54 @@
+[package]
+name = "vela"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vela Contributors"]
+description = "A single-binary service health orchestrator for lean Linux deployments"
+license = "MIT"
+repository = "https://github.com/34Herveonly/Vela_Project"
+readme = "README.md"
+keywords = ["proxy", "health-check", "orchestrator", "devops", "microservices"]
+categories = ["network-programming", "command-line-utilities"]
+
+[[bin]]
+name = "vela"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — standard choice for Rust networking; stdlib has no async executor
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for health checks and outgoing alert webhooks
+# reqwest is the de-facto standard; stdlib has no HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# HTTP server for the API engine and proxy engine
+# axum is the tokio-native server; built on hyper; well-maintained
+axum = { version = "0.7", features = ["tokio"] }
+
+# TOML config file parsing — stdlib has no TOML parser
+toml = "0.8"
+
+# Struct deserialization from TOML/JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Timestamp handling — stdlib time APIs are insufficient for formatting/serialization
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async channel for event broadcasting between engines
+tokio-stream = "0.1"
+
+[dev-dependencies]
+# HTTP test server for integration tests
+mockito = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
