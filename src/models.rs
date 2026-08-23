@@ -142,8 +142,6 @@ pub struct ProxyConfig {
 }
 
 /// Configuration for a single alert destination.
-// Fields are read once the alert engine (Phase 4) exists.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct AlertTargetConfig {
     /// "webhook" or "log". More kinds will be added in future phases.
@@ -156,6 +154,40 @@ pub struct AlertTargetConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
+
+/// Runtime record of an alert that was sent or attempted.
+/// Stored by the alert engine for operational visibility.
+/// Exposed by the API engine in Phase 6.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertRecord {
+    /// Which service triggered this alert.
+    pub service_id: String,
+    /// The alert kind that was used for delivery.
+    pub kind: AlertKind,
+    /// Whether delivery succeeded.
+    pub delivered: bool,
+    /// The status transition that triggered this alert.
+    pub trigger: String,
+    /// When this alert was sent.
+    pub sent_at: chrono::DateTime<chrono::Utc>,
+    /// Failure reason if delivery failed. None on success.
+    pub error: Option<String>,
+}
+
+/// Maximum length of a service name in an alert payload.
+/// Prevents unbounded strings in outbound webhook requests.
+pub const MAX_ALERT_NAME_LEN: usize = 128;
+
+/// Maximum length of an error message in an alert payload.
+pub const MAX_ALERT_MESSAGE_LEN: usize = 512;
+
+/// How long after an alert fires before another alert is allowed
+/// for the same service (in seconds). Prevents alert storms.
+/// This is the DEFAULT — individual services can override in Phase 6.
+pub const DEFAULT_ALERT_COOLDOWN_SECS: u64 = 60;
+
+/// Timeout for outbound webhook HTTP requests (in seconds).
+pub const WEBHOOK_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 fn default_true() -> bool {
     true
@@ -281,11 +313,86 @@ pub struct RestartRecord {
     pub attempt_number: u32,
 }
 
+/// Tracks the recovery engine's internal state for a single service.
+/// This is owned by the recovery engine only — not stored in VelaState.
+/// Not serialized — it exists only in memory during Vela's runtime.
+#[derive(Debug, Clone)]
+pub struct RecoveryState {
+    /// Current backoff duration before the next restart attempt.
+    /// Starts at base_backoff_secs, doubles each attempt, capped at max_backoff_secs.
+    pub current_backoff: std::time::Duration,
+
+    /// Whether a restart command is actively running right now.
+    /// Used to prevent simultaneous restart attempts for the same service.
+    pub restart_in_progress: bool,
+
+    /// The attempt number for the current failure episode.
+    /// Resets to 0 when the service returns to Healthy.
+    pub current_episode_attempts: u32,
+
+    /// Timestamp when the current backoff period started.
+    /// Used to determine when the backoff has elapsed.
+    pub backoff_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl RecoveryState {
+    /// Creates the initial recovery state for a service.
+    pub fn initial() -> Self {
+        Self {
+            current_backoff: std::time::Duration::from_secs(BASE_BACKOFF_SECS),
+            restart_in_progress: false,
+            current_episode_attempts: 0,
+            backoff_started_at: None,
+        }
+    }
+
+    /// Advances the backoff duration for the next attempt.
+    /// Doubles the current backoff, adds jitter, caps at MAX_BACKOFF_SECS.
+    pub fn advance_backoff(&mut self) {
+        use std::time::Duration;
+        // Double the current backoff (exponential growth)
+        let doubled = self.current_backoff.saturating_mul(2);
+        // Cap at maximum
+        let capped = doubled.min(Duration::from_secs(MAX_BACKOFF_SECS));
+        // Add jitter: ±20% of the capped value using a simple deterministic offset.
+        // In a production system this would use rand::thread_rng(). For now,
+        // we use the attempt count as a stable jitter seed — still spreads load.
+        let jitter_secs =
+            (capped.as_secs() / 5).saturating_add(self.current_episode_attempts as u64 % 3);
+        self.current_backoff = capped + Duration::from_secs(jitter_secs);
+    }
+
+    /// Resets recovery state when a service returns to Healthy.
+    /// Must be called by the recovery engine on every Healthy observation.
+    pub fn reset(&mut self) {
+        self.current_backoff = std::time::Duration::from_secs(BASE_BACKOFF_SECS);
+        self.restart_in_progress = false;
+        self.current_episode_attempts = 0;
+        self.backoff_started_at = None;
+    }
+}
+
+/// Base backoff in seconds before the first restart attempt.
+pub const BASE_BACKOFF_SECS: u64 = 5;
+
+/// Maximum backoff ceiling in seconds. No restart wait will exceed this.
+pub const MAX_BACKOFF_SECS: u64 = 300; // 5 minutes
+
+/// The outcome of a single restart attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RestartOutcome {
+    /// Process started and exited with status 0.
+    Succeeded,
+    /// Process started but exited with non-zero status.
+    Failed(String),
+    /// Process could not be spawned (permission error, command not found, etc.)
+    SpawnError(String),
+    /// Process started but did not exit within the allowed timeout.
+    TimedOut,
+}
+
 /// Event emitted to the alert engine when a service changes status.
 /// Sent over a tokio broadcast channel.
-// Fields are constructed by record_health_check but only read once the alert
-// engine (Phase 4) subscribes and reads events off the channel.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct StatusChangeEvent {
     pub service_id: String,

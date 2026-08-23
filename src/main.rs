@@ -12,14 +12,14 @@
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
+mod alert;
 mod config;
 mod error;
 mod health;
 mod models;
+mod recovery;
 mod state;
 // Uncomment as each phase is implemented:
-// mod recovery;
-// mod alert;
 // mod proxy;
 // mod api;
 
@@ -62,9 +62,8 @@ async fn main() {
 
     // Phase 2: Initialize shared state store
     let (state, event_rx) = state::VelaState::new();
-    // event_rx is kept alive here — it will be consumed by the alert engine in Phase 4.
-    // Dropping it early would close the broadcast channel prematurely.
-    let _event_rx_held = event_rx;
+    // event_rx is passed directly to the alert engine below.
+    // It must NOT be dropped before the alert engine starts.
 
     // Phase 3: Register all services in state store
     if let Err(e) = config::register_services(&vela_config, &state).await {
@@ -89,8 +88,31 @@ async fn main() {
         }
     };
 
-    // PLACEHOLDER: recovery engine starts here in Phase 3
-    // PLACEHOLDER: alert engine starts here in Phase 4
+    // Start the recovery engine — polls for Failed services and restarts them.
+    let recovery_handle = match recovery::run(state.clone(), vela_config.services.clone()).await {
+        Ok(handle) => {
+            tracing::info!("Recovery engine started successfully.");
+            handle
+        }
+        Err(e) => {
+            tracing::error!("Failed to start recovery engine: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Start the alert engine — delivers notifications on status transitions.
+    let alert_handle = match alert::run(state.clone(), event_rx, vela_config.services.clone()).await
+    {
+        Ok(handle) => {
+            tracing::info!("Alert engine started successfully.");
+            handle
+        }
+        Err(e) => {
+            tracing::error!("Failed to start alert engine: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // PLACEHOLDER: proxy engine starts here in Phase 5
     // PLACEHOLDER: API engine starts here in Phase 6
 
@@ -103,7 +125,10 @@ async fn main() {
         .expect("Failed to listen for ctrl-c");
     tracing::info!("Shutdown signal received. Stopping engines gracefully...");
 
-    // Shutdown in reverse startup order
+    // Shutdown in reverse startup order:
+    // Alert engine first — no point delivering alerts for engines that are stopping.
+    alert_handle.shutdown().await;
+    recovery_handle.shutdown().await;
     health_handle.shutdown().await;
 
     tracing::info!("Vela shut down cleanly. Goodbye.");
