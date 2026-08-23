@@ -26,8 +26,22 @@ pub enum VelaError {
     /// A service process could not be spawned or managed.
     ProcessError(String),
 
+    /// Recovery engine exceeded max_restarts for a service without recovery.
+    /// The service is now in a permanently failed state until manually intervened.
+    MaxRestartsExceeded { service_id: String, attempts: u32 },
+
+    /// A restart command timed out before completing.
+    RestartTimeout {
+        service_id: String,
+        timeout_secs: u64,
+    },
+
     /// An outbound alert (webhook, email) failed to deliver.
     AlertDeliveryFailed { kind: String, reason: String },
+
+    /// A webhook URL failed security validation before delivery was attempted.
+    /// This is a configuration error — log it clearly so the user can fix it.
+    InsecureWebhookUrl { url: String },
 
     /// The reverse proxy could not forward a request.
     ProxyError(String),
@@ -64,8 +78,34 @@ impl fmt::Display for VelaError {
                 )
             }
             VelaError::ProcessError(msg) => write!(f, "Process error: {}", msg),
+            VelaError::MaxRestartsExceeded {
+                service_id,
+                attempts,
+            } => {
+                write!(
+                    f,
+                    "Service '{}' exceeded max restarts ({} attempts) — manual intervention required",
+                    service_id, attempts
+                )
+            }
+            VelaError::RestartTimeout {
+                service_id,
+                timeout_secs,
+            } => {
+                write!(
+                    f,
+                    "Restart command for '{}' timed out after {}s",
+                    service_id, timeout_secs
+                )
+            }
             VelaError::AlertDeliveryFailed { kind, reason } => {
                 write!(f, "Alert delivery failed [{}]: {}", kind, reason)
+            }
+            VelaError::InsecureWebhookUrl { url } => {
+                // SECURITY: never log the full URL if it might contain credentials.
+                // Truncate to scheme+host only in the error message.
+                let safe_url = url.split('?').next().unwrap_or("(url hidden)");
+                write!(f, "Webhook URL failed security validation: {}", safe_url)
             }
             VelaError::ProxyError(msg) => write!(f, "Proxy error: {}", msg),
             VelaError::ApiError(msg) => write!(f, "API error: {}", msg),

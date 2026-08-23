@@ -36,6 +36,9 @@ pub struct StateInner {
 
     /// Rolling log of restart attempts, keyed by service_id.
     pub restart_records: HashMap<String, Vec<RestartRecord>>,
+
+    /// Rolling log of sent alerts, keyed by service_id.
+    pub alert_records: HashMap<String, Vec<crate::models::AlertRecord>>,
 }
 
 /// The shared state store, safe to clone and send across async tasks.
@@ -58,6 +61,7 @@ impl VelaState {
                 services: HashMap::new(),
                 health_records: HashMap::new(),
                 restart_records: HashMap::new(),
+                alert_records: HashMap::new(),
             })),
             event_tx,
         };
@@ -73,7 +77,8 @@ impl VelaState {
             ServiceState::initial(service_id.clone()),
         );
         inner.health_records.insert(service_id.clone(), Vec::new());
-        inner.restart_records.insert(service_id, Vec::new());
+        inner.restart_records.insert(service_id.clone(), Vec::new());
+        inner.alert_records.insert(service_id, Vec::new());
         Ok(())
     }
 
@@ -147,8 +152,6 @@ impl VelaState {
     }
 
     /// Records a restart attempt made by the recovery engine.
-    // Called starting with the recovery engine (Phase 3).
-    #[allow(dead_code)]
     pub async fn record_restart(&self, record: RestartRecord) -> Result<(), VelaError> {
         let mut inner = self.inner.write().await;
 
@@ -171,6 +174,41 @@ impl VelaState {
         }
 
         Ok(())
+    }
+
+    /// Records a sent (or attempted) alert in the shared state store.
+    /// Called by the alert engine after each delivery attempt.
+    ///
+    /// SECURITY: AlertRecord must never contain secret keys or credentials.
+    /// The alert engine is responsible for ensuring this before calling.
+    pub async fn record_alert(&self, record: crate::models::AlertRecord) -> Result<(), VelaError> {
+        const MAX_ALERT_RECORDS: usize = 50;
+        let mut inner = self.inner.write().await;
+
+        let records = inner
+            .alert_records
+            .entry(record.service_id.clone())
+            .or_default();
+
+        records.push(record);
+        if records.len() > MAX_ALERT_RECORDS {
+            records.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Returns recent alert records for a single service.
+    /// Called by the API engine in Phase 6.
+    // Only exercised by tests until the API engine (Phase 6) calls it.
+    #[allow(dead_code)]
+    pub async fn get_alert_records(&self, service_id: &str) -> Vec<crate::models::AlertRecord> {
+        self.inner
+            .read()
+            .await
+            .alert_records
+            .get(service_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Returns a snapshot of all service states (for the API engine).
