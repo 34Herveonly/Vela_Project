@@ -43,6 +43,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Async channel for event broadcasting between engines
 tokio-stream = "0.1"
 
+# tokio-util: provides CancellationToken for cooperative task shutdown.
+# tokio itself does not provide CancellationToken — this crate is the official extension.
+tokio-util = { version = "0.7", features = ["rt"] }
+
 [dev-dependencies]
 # HTTP test server for integration tests
 mockito = "1"
