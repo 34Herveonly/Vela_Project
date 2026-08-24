@@ -23,7 +23,8 @@ pub struct VelaConfig {
 }
 
 /// Global configuration that applies to the entire Vela instance.
-// api_port and log_dir are read once the API engine (Phase 6) exists.
+// api_port is read (proxy validation, API engine bind). log_dir is parsed
+// but never consumed — Vela logs to stdout only; file logging is unbuilt.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalConfig {
@@ -430,4 +431,95 @@ pub struct StatusChangeEvent {
     pub new_status: ServiceStatus,
     pub timestamp: DateTime<Utc>,
     pub message: String,
+}
+
+// ─── API Response Types ───────────────────────────────────────────────────────
+// These are stable external types — changes here are breaking API changes.
+// Never expose internal structs (ServiceState, VelaState) directly via the API.
+
+/// The stable API version string included in every response envelope.
+pub const API_VERSION: &str = "1";
+
+/// Standard envelope wrapping every API response.
+/// Provides consistent structure for clients to parse.
+#[derive(Debug, Serialize)]
+pub struct ApiResponse<T: Serialize> {
+    pub ok: bool,
+    pub version: &'static str,
+    pub data: T,
+}
+
+impl<T: Serialize> ApiResponse<T> {
+    pub fn success(data: T) -> Self {
+        Self {
+            ok: true,
+            version: API_VERSION,
+            data,
+        }
+    }
+}
+
+/// Standard error envelope for API error responses.
+/// SECURITY: `message` must never include internal details, stack traces,
+/// config values, or anything that could aid an attacker.
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    pub ok: bool,
+    pub version: &'static str,
+    /// Generic, safe-to-expose error description.
+    pub error: String,
+}
+
+impl ApiError {
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            version: API_VERSION,
+            error: error.into(),
+        }
+    }
+}
+
+/// Public-facing summary of a monitored service.
+/// Derived from ServiceState + ServiceConfig — never exposes internal structs.
+#[derive(Debug, Serialize)]
+pub struct ServiceSummary {
+    pub service_id: String,
+    pub service_name: String,
+    pub status: String, // "Healthy" | "Degraded" | "Failed" | "Unknown"
+    pub consecutive_failures: u32,
+    pub restart_count: u32,
+    pub is_recovering: bool,
+    pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ServiceSummary {
+    /// Converts internal ServiceState to the public API response type.
+    /// Add fields here deliberately — this is a public contract.
+    pub fn from_state(state: &ServiceState, name: &str) -> Self {
+        Self {
+            service_id: state.service_id.clone(),
+            service_name: name.to_string(),
+            status: format!("{:?}", state.status),
+            consecutive_failures: state.consecutive_failures,
+            restart_count: state.restart_count,
+            is_recovering: state.is_recovering,
+            last_checked_at: state.last_checked_at,
+            last_ok_at: state.last_ok_at,
+        }
+    }
+}
+
+/// Top-level status response returned by GET /api/v1/status.
+#[derive(Debug, Serialize)]
+pub struct VelaStatusResponse {
+    /// Count of services in each status category.
+    pub healthy_count: usize,
+    pub degraded_count: usize,
+    pub failed_count: usize,
+    pub unknown_count: usize,
+    pub total_services: usize,
+    /// Full summary list of all monitored services.
+    pub services: Vec<ServiceSummary>,
 }

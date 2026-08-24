@@ -47,9 +47,17 @@ tokio-stream = "0.1"
 # tokio itself does not provide CancellationToken — this crate is the official extension.
 tokio-util = { version = "0.7", features = ["rt"] }
 
+# subtle: constant-time byte comparison for API key authentication.
+# std equality operators short-circuit and leak timing information.
+# This crate provides ConstantTimeEq that compares in fixed time.
+subtle = "2"
+
 [dev-dependencies]
 # HTTP test server for integration tests
 mockito = "1"
+
+# tower: provides ServiceExt::oneshot for axum handler unit testing
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

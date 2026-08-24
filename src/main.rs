@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 mod alert;
+mod api;
 mod config;
 mod error;
 mod health;
@@ -20,8 +21,6 @@ mod models;
 mod proxy;
 mod recovery;
 mod state;
-// Uncomment as each phase is implemented:
-// mod api;
 
 #[tokio::main]
 async fn main() {
@@ -134,7 +133,28 @@ async fn main() {
         }
     };
 
-    // PLACEHOLDER: API engine starts here in Phase 6
+    // Start the API engine — REST API for status and operational control.
+    let api_handle = match api::run(
+        state.clone(),
+        vela_config.services.clone(),
+        vela_config.global.api_port,
+        vela_config.global.api_key.clone(),
+    )
+    .await
+    {
+        Ok(handle) => {
+            tracing::info!(
+                "API engine started on port {} (API v{}).",
+                vela_config.global.api_port,
+                crate::models::API_VERSION,
+            );
+            handle
+        }
+        Err(e) => {
+            tracing::error!("Failed to start API engine: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     tracing::info!("Vela is running. Press Ctrl+C to stop.");
     tracing::info!("Set RUST_LOG=debug for per-check verbose output.");
@@ -145,15 +165,13 @@ async fn main() {
         .expect("Failed to listen for ctrl-c");
     tracing::info!("Shutdown signal received. Stopping engines gracefully...");
 
-    // Shutdown in reverse startup order:
-    // Proxy first — stop accepting user traffic before anything else stops.
-    // Alert engine second — deliver any final status change notifications.
-    // Recovery third — stop acting on failures.
-    // Health last — stop detecting failures.
+    // Shutdown order: API last (operators can still query status while engines stop)
+    // Then proxy (stop user traffic), alert (final notifications), recovery, health.
     proxy_handle.shutdown().await;
     alert_handle.shutdown().await;
     recovery_handle.shutdown().await;
     health_handle.shutdown().await;
+    api_handle.shutdown().await; // Last — status remains queryable until end
 
     tracing::info!("Vela shut down cleanly. Goodbye.");
 }

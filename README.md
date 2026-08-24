@@ -109,18 +109,56 @@ enabled  = true
 
 ## API reference
 
-All endpoints require `Authorization: Bearer <api_key>` header.
+All endpoints except `/health` require `Authorization: Bearer <api_key>` header.
+The key is set in `config.toml` under `global.api_key`.
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/v1/status` | Returns status of all services |
-| GET | `/api/v1/services/:id` | Returns detailed state for one service |
-| GET | `/api/v1/services/:id/history` | Returns recent health check records |
-| POST | `/api/v1/services/:id/restart` | Triggers a manual restart |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/health` | None | Liveness probe — for Docker/K8s health checks |
+| GET | `/api/v1/status` | Required | Aggregated status + counts for all services |
+| GET | `/api/v1/services` | Required | List of all service summaries |
+| GET | `/api/v1/services/:id` | Required | Detailed state for one service |
+| GET | `/api/v1/services/:id/checks` | Required | Recent health check records |
+| GET | `/api/v1/services/:id/alerts` | Required | Recent alert records |
+| GET | `/api/v1/services/:id/restarts` | Required | Recent restart attempt records |
 
-Example:
+### Response format
+
+All responses use a standard envelope:
+```json
+{
+  "ok": true,
+  "version": "1",
+  "data": { ... }
+}
+```
+
+Error responses:
+```json
+{
+  "ok": false,
+  "version": "1",
+  "error": "Human-readable message"
+}
+```
+
+### Example requests
+
 ```bash
-curl -H "Authorization: Bearer your-key" http://localhost:7700/api/v1/status
+# Liveness check (no auth)
+curl http://localhost:7700/health
+
+# Full status
+curl -H "Authorization: Bearer your-api-key" \
+  http://localhost:7700/api/v1/status
+
+# Single service detail
+curl -H "Authorization: Bearer your-api-key" \
+  http://localhost:7700/api/v1/services/auth-service
+
+# Recent health checks
+curl -H "Authorization: Bearer your-api-key" \
+  http://localhost:7700/api/v1/services/auth-service/checks
 ```
 
 ## Running tests
@@ -146,12 +184,14 @@ coherent as multiple contributors (and AI agents) work on it.
 
 | Phase | Status |
 |---|---|
-| Phase 1 — Config engine + models | In progress |
-| Phase 2 — Health engine | Planned |
-| Phase 3 — Recovery engine | Planned |
-| Phase 4 — Alert engine | Planned |
-| Phase 5 — Proxy engine | Planned |
-| Phase 6 — API engine | Planned |
+| Phase 1 — Config engine + models | Done |
+| Phase 2 — Health engine | Done |
+| Phase 3 — Recovery engine | Done |
+| Phase 4 — Alert engine | Done |
+| Phase 5 — Proxy engine | Done |
+| Phase 6 — API engine | Done |
+
+v0.1.0 — all six engines implemented and wired together.
 
 ## License
 
