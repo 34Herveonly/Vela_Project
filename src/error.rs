@@ -46,6 +46,20 @@ pub enum VelaError {
     /// The reverse proxy could not forward a request.
     ProxyError(String),
 
+    /// No healthy upstream is available to handle this connection.
+    /// Returned as a 502 to the client.
+    UpstreamUnavailable { service_id: String },
+
+    /// The proxy engine could not bind a listen port.
+    /// Usually means the port is already in use.
+    ProxyBindError { port: u16, reason: String },
+
+    /// The configured proxy ports conflict with each other or with the API port.
+    ProxyPortConflict { port: u16, reason: String },
+
+    /// Maximum concurrent connections reached for a proxy listener.
+    ConnectionLimitExceeded { service_id: String, limit: usize },
+
     /// The API engine encountered an error handling a request.
     ApiError(String),
 
@@ -108,6 +122,30 @@ impl fmt::Display for VelaError {
                 write!(f, "Webhook URL failed security validation: {}", safe_url)
             }
             VelaError::ProxyError(msg) => write!(f, "Proxy error: {}", msg),
+            VelaError::UpstreamUnavailable { service_id } => {
+                write!(
+                    f,
+                    "No healthy upstream available for service '{}'",
+                    service_id
+                )
+            }
+            VelaError::ProxyBindError { port, reason } => {
+                write!(
+                    f,
+                    "Failed to bind proxy listener on port {}: {}",
+                    port, reason
+                )
+            }
+            VelaError::ProxyPortConflict { port, reason } => {
+                write!(f, "Proxy port conflict on port {}: {}", port, reason)
+            }
+            VelaError::ConnectionLimitExceeded { service_id, limit } => {
+                write!(
+                    f,
+                    "Connection limit ({}) exceeded for service '{}' proxy",
+                    limit, service_id
+                )
+            }
             VelaError::ApiError(msg) => write!(f, "API error: {}", msg),
             VelaError::StateError(msg) => write!(f, "State error: {}", msg),
             VelaError::Io(e) => write!(f, "IO error: {}", e),

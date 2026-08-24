@@ -48,8 +48,6 @@ fn default_log_dir() -> String {
 
 /// Configuration for a single monitored service.
 /// Parsed from a [[services]] block in config.toml.
-// Most fields are read once the health/recovery/proxy/alert engines (Phase 2+) exist.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
     /// Unique identifier for this service. Used in logs, alerts, and the API.
@@ -133,12 +131,17 @@ pub enum HealthCheckKind {
 /// Proxy configuration for a service.
 /// When present, Vela accepts incoming traffic on `listen_port`
 /// and forwards it to the service's host:port.
-// listen_port is read once the proxy engine (Phase 5) exists.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfig {
     /// Port Vela listens on to receive traffic for this service.
     pub listen_port: u16,
+
+    /// If true, bind to 0.0.0.0 (all interfaces).
+    /// If false (default), bind to 127.0.0.1 (loopback only).
+    /// Set to true only if external traffic must reach this proxy port.
+    /// WARNING: Ensure firewall rules are in place before enabling.
+    #[serde(default)]
+    pub bind_all_interfaces: bool,
 }
 
 /// Configuration for a single alert destination.
@@ -188,6 +191,32 @@ pub const DEFAULT_ALERT_COOLDOWN_SECS: u64 = 60;
 
 /// Timeout for outbound webhook HTTP requests (in seconds).
 pub const WEBHOOK_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum concurrent connections per proxy listener.
+/// Enforced via semaphore — prevents file descriptor exhaustion.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+
+/// Seconds of inactivity before an idle connection is closed.
+/// Prevents resource exhaustion from clients that connect and do nothing.
+pub const PROXY_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// Seconds of stall before an active transfer is terminated.
+/// Prevents resource exhaustion from stalled upstream connections.
+pub const PROXY_TRANSFER_TIMEOUT_SECS: u64 = 60;
+
+/// A resolved proxy listener binding: the listen address, the upstream
+/// address, and the service it belongs to. Built at startup from config.
+#[derive(Debug, Clone)]
+pub struct ProxyBinding {
+    /// Unique ID of the service this proxy forwards to.
+    pub service_id: String,
+    /// Human-readable service name (for logs).
+    pub service_name: String,
+    /// The socket address Vela listens on (e.g., "127.0.0.1:8001").
+    pub listen_addr: String,
+    /// The upstream address to forward to (e.g., "127.0.0.1:3001").
+    pub upstream_addr: String,
+}
 
 fn default_true() -> bool {
     true

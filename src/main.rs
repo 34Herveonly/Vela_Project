@@ -17,10 +17,10 @@ mod config;
 mod error;
 mod health;
 mod models;
+mod proxy;
 mod recovery;
 mod state;
 // Uncomment as each phase is implemented:
-// mod proxy;
 // mod api;
 
 #[tokio::main]
@@ -59,6 +59,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Validate proxy port configuration up front — before any engine starts.
+    // A misconfigured proxy port must never leave health/recovery/alert engines
+    // running only to be exit(1)'d out from under them moments later.
+    if let Err(e) = proxy::validate_proxy_config(&vela_config) {
+        tracing::error!("Proxy configuration error: {}", e);
+        std::process::exit(1);
+    }
 
     // Phase 2: Initialize shared state store
     let (state, event_rx) = state::VelaState::new();
@@ -113,7 +121,19 @@ async fn main() {
         }
     };
 
-    // PLACEHOLDER: proxy engine starts here in Phase 5
+    // Start the proxy engine — health-aware TCP reverse proxy.
+    // (Port configuration was already validated up front, before any engine started.)
+    let proxy_handle = match proxy::run(state.clone(), &vela_config).await {
+        Ok(handle) => {
+            tracing::info!("Proxy engine started successfully.");
+            handle
+        }
+        Err(e) => {
+            tracing::error!("Failed to start proxy engine: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // PLACEHOLDER: API engine starts here in Phase 6
 
     tracing::info!("Vela is running. Press Ctrl+C to stop.");
@@ -126,7 +146,11 @@ async fn main() {
     tracing::info!("Shutdown signal received. Stopping engines gracefully...");
 
     // Shutdown in reverse startup order:
-    // Alert engine first — no point delivering alerts for engines that are stopping.
+    // Proxy first — stop accepting user traffic before anything else stops.
+    // Alert engine second — deliver any final status change notifications.
+    // Recovery third — stop acting on failures.
+    // Health last — stop detecting failures.
+    proxy_handle.shutdown().await;
     alert_handle.shutdown().await;
     recovery_handle.shutdown().await;
     health_handle.shutdown().await;

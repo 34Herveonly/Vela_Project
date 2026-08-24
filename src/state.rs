@@ -211,9 +211,7 @@ impl VelaState {
             .unwrap_or_default()
     }
 
-    /// Returns a snapshot of all service states (for the API engine).
-    // Called starting with the API engine (Phase 6).
-    #[allow(dead_code)]
+    /// Returns a snapshot of all service states (also used by the API engine, Phase 6).
     pub async fn snapshot_services(&self) -> HashMap<String, ServiceState> {
         self.inner.read().await.services.clone()
     }
