@@ -31,6 +31,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security
@@ -49,6 +50,11 @@ USER vela
 
 # Expose the API port (proxy ports are configured per-service)
 EXPOSE 7700
+
+# Use the unauthenticated /health endpoint as the Docker health probe.
+# 3 retries × 10s interval = 30s before container is marked unhealthy.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:7700/health || exit 1
 
 # Vela expects config.toml to be mounted at /etc/vela/config.toml
 ENTRYPOINT ["/usr/local/bin/vela", "/etc/vela/config.toml"]

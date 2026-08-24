@@ -15,13 +15,9 @@ use tokio::sync::{broadcast, RwLock};
 
 /// Maximum number of health records kept per service.
 /// Older records are dropped when this limit is reached.
-// Only read once the health engine (Phase 2) calls record_health_check.
-#[allow(dead_code)]
 const MAX_HEALTH_RECORDS: usize = 100;
 
 /// Maximum number of restart records kept per service.
-// Only read once the recovery engine (Phase 3) calls record_restart.
-#[allow(dead_code)]
 const MAX_RESTART_RECORDS: usize = 50;
 
 /// The inner data of the state store.
@@ -47,8 +43,6 @@ pub struct VelaState {
     inner: Arc<RwLock<StateInner>>,
     /// Broadcast channel sender for status change events.
     /// The alert engine subscribes to this.
-    // Only read once the alert engine (Phase 4) subscribes.
-    #[allow(dead_code)]
     pub event_tx: broadcast::Sender<StatusChangeEvent>,
 }
 
@@ -198,9 +192,7 @@ impl VelaState {
     }
 
     /// Returns recent alert records for a single service.
-    /// Called by the API engine in Phase 6.
-    // Only exercised by tests until the API engine (Phase 6) calls it.
-    #[allow(dead_code)]
+    /// Called by the API engine.
     pub async fn get_alert_records(&self, service_id: &str) -> Vec<crate::models::AlertRecord> {
         self.inner
             .read()
@@ -217,13 +209,23 @@ impl VelaState {
     }
 
     /// Returns recent health records for a single service (for the API engine).
-    // Only exercised by tests until the API engine (Phase 6) calls it.
-    #[allow(dead_code)]
     pub async fn get_health_records(&self, service_id: &str) -> Vec<HealthRecord> {
         self.inner
             .read()
             .await
             .health_records
+            .get(service_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns recent restart attempt records for a single service.
+    /// Called by the API engine to expose restart history.
+    pub async fn get_restart_records(&self, service_id: &str) -> Vec<RestartRecord> {
+        self.inner
+            .read()
+            .await
+            .restart_records
             .get(service_id)
             .cloned()
             .unwrap_or_default()

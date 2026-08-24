@@ -7,7 +7,12 @@ use std::fmt;
 /// The single error type used across all Vela engines.
 /// Add new variants here when a genuinely new failure category is needed.
 /// Do not create local error types in engine files.
-// Some variants are only constructed once their owning engine (Phase 2+) exists.
+// ProcessError, MaxRestartsExceeded, RestartTimeout, InsecureWebhookUrl,
+// UpstreamUnavailable, ConnectionLimitExceeded, and ProxyError describe real
+// failure modes their owning engines detect via logging today rather than by
+// returning a typed Result — they exist so callers have a stable, named error
+// to construct if that changes. Not dead in the sense of being unreachable
+// design, just not yet wired to a return path.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum VelaError {
