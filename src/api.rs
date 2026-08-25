@@ -32,7 +32,7 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -142,11 +142,18 @@ pub async fn run(
 
 /// Builds the axum router with all routes and middleware.
 /// Auth middleware wraps all /api/v1/ routes.
-/// The /health liveness probe is intentionally outside the auth layer.
+/// The /health liveness probe and / dashboard are intentionally outside
+/// the auth layer — the dashboard handles its own auth via a Bearer token
+/// entered client-side in JS and sent on every fetch() to /api/v1/*.
 fn build_router(state: AppState) -> Router {
-    // Unauthenticated routes — liveness probe for Docker/Kubernetes/load balancers.
-    // SECURITY: This endpoint deliberately returns minimal information.
-    let public_routes = Router::new().route("/health", get(handle_liveness));
+    // Unauthenticated routes — liveness probe for Docker/Kubernetes/load balancers,
+    // and the embedded web dashboard.
+    // SECURITY: /health deliberately returns minimal information. The dashboard
+    // itself carries no Vela data — everything it shows is fetched client-side
+    // through the authenticated /api/v1/* routes below.
+    let public_routes = Router::new()
+        .route("/health", get(handle_liveness))
+        .route("/", get(handle_dashboard));
 
     // Authenticated routes — all require valid Bearer token.
     let authenticated_routes = Router::new()
@@ -258,6 +265,28 @@ async fn handle_liveness() -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "service": "vela" })),
+    )
+}
+
+/// The embedded web dashboard — a single self-contained HTML/CSS/JS file
+/// compiled into the binary at build time. No build step, no npm, no CDN.
+///
+/// This `include_str!` path is relative to this file (src/api.rs), so
+/// "dashboard/dashboard.html" resolves to src/dashboard/dashboard.html.
+const DASHBOARD_HTML: &str = include_str!("dashboard/dashboard.html");
+
+/// GET / — serves the embedded web dashboard.
+///
+/// Unauthenticated by design: the HTML/CSS/JS itself carries no Vela data.
+/// The browser prompts for an API key on first load, keeps it in
+/// sessionStorage only, and sends it as a Bearer token on every fetch()
+/// to the authenticated /api/v1/* routes — the same auth boundary every
+/// other client (curl, vela-ctl) goes through.
+async fn handle_dashboard() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("Cache-Control", "no-store")],
+        Html(DASHBOARD_HTML),
     )
 }
 

@@ -15,14 +15,20 @@ WORKDIR /build
 # This layer is only rebuilt when Cargo.toml or Cargo.lock changes.
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main.rs to build dependencies in isolation
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create dummy entry points for BOTH [[bin]] targets (vela, vela-ctl) to
+# build dependencies in isolation. Cargo resolves every declared [[bin]]
+# path against the manifest before compiling anything, so a stub is needed
+# for vela-ctl too — leaving it out fails this layer with a
+# "couldn't read src/bin/vela_ctl/main.rs" error, not a dependency skip.
+RUN mkdir -p src/bin/vela_ctl && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "fn main() {}" > src/bin/vela_ctl/main.rs
 RUN cargo build --release
-RUN rm src/main.rs
+RUN rm -rf src
 
-# Copy actual source code and build the real binary
+# Copy actual source code and build the real binaries
 COPY src ./src
-RUN touch src/main.rs
+RUN touch src/main.rs src/bin/vela_ctl/main.rs
 RUN cargo build --release
 
 # Stage 2: Runtime
@@ -41,9 +47,10 @@ RUN useradd -r -s /bin/false vela
 RUN mkdir -p /etc/vela /var/log/vela && \
     chown vela:vela /var/log/vela
 
-# Copy the compiled binary from the builder stage
+# Copy the compiled binaries from the builder stage
 COPY --from=builder /build/target/release/vela /usr/local/bin/vela
-RUN chmod +x /usr/local/bin/vela
+COPY --from=builder /build/target/release/vela-ctl /usr/local/bin/vela-ctl
+RUN chmod +x /usr/local/bin/vela /usr/local/bin/vela-ctl
 
 # Switch to non-root user
 USER vela

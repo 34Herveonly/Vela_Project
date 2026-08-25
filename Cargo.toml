@@ -14,13 +14,26 @@ categories = ["network-programming", "command-line-utilities"]
 name = "vela"
 path = "src/main.rs"
 
+[[bin]]
+name = "vela-ctl"
+path = "src/bin/vela_ctl/main.rs"
+
 [dependencies]
 # Async runtime — standard choice for Rust networking; stdlib has no async executor
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client for health checks and outgoing alert webhooks
-# reqwest is the de-facto standard; stdlib has no HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# HTTP client for health checks, outgoing alert webhooks, and (blocking mode)
+# the vela-ctl CLI. reqwest is the de-facto standard; stdlib has no HTTP client.
+# "blocking" is needed by vela-ctl, a short-lived CLI that has no reason to
+# carry an async runtime just to make a handful of sequential HTTP calls.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+
+# clap: CLI argument parsing for vela-ctl. stdlib has no argument parser.
+clap = { version = "4", features = ["derive", "color"] }
+
+# colored: terminal color output for vela-ctl's status display.
+# stdlib has no terminal color support.
+colored = "2"
 
 # HTTP server for the API engine and proxy engine
 # axum is the tokio-native server; built on hyper; well-maintained
