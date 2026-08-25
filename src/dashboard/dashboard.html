@@ -1,0 +1,1310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vela — Service Monitor</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+                   'Helvetica Neue', Arial, sans-serif;
+      background: #f5f5f7;
+      color: #111827;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+    a { text-decoration: none; color: inherit; }
+    button { cursor: pointer; border: none; background: none; font: inherit; }
+
+    /* ── Header ───────────────────────────────────────────────────── */
+    .header {
+      background: #fff;
+      border-bottom: 1px solid #e5e7eb;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 24px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 16px;
+      color: #111827;
+      min-width: 120px;
+    }
+    .logo-icon {
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .logo-icon svg { width: 28px; height: 28px; }
+    .header-summary {
+      font-size: 12px;
+      color: #6b7280;
+      line-height: 1.3;
+      min-width: 80px;
+    }
+    .header-summary span { display: block; }
+    .header-summary .summary-bold { font-weight: 600; color: #111827; }
+    .header-nav {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: 1;
+    }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      color: #6b7280;
+      font-weight: 500;
+      cursor: pointer;
+      transition: color 0.15s, background 0.15s;
+      border-bottom: 2px solid transparent;
+    }
+    .nav-item:hover { color: #111827; background: #f3f4f6; }
+    .nav-item.active {
+      color: #111827;
+      font-weight: 600;
+      border-bottom-color: #111827;
+      background: none;
+    }
+    .nav-item svg { width: 15px; height: 15px; opacity: 0.7; }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-left: auto;
+      font-size: 13px;
+      color: #6b7280;
+    }
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+      color: #111827;
+    }
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .disconnected .live-dot { background: #ef4444; animation: none; }
+
+    /* ── Auth overlay ─────────────────────────────────────────────── */
+    .auth-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.5);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    .auth-card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 32px;
+      width: 400px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+    }
+    .auth-card h2 { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+    .auth-card p { color: #6b7280; font-size: 14px; margin-bottom: 24px; }
+    .auth-card label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .auth-card input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      font-size: 14px;
+      margin-bottom: 16px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .auth-card input:focus { border-color: #6366f1; }
+    .auth-card .auth-error {
+      color: #ef4444;
+      font-size: 13px;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .btn-primary {
+      width: 100%;
+      padding: 10px;
+      background: #111827;
+      color: #fff;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover { background: #1f2937; }
+
+    /* ── Page layout ──────────────────────────────────────────────── */
+    .page { display: none; padding: 32px 24px; max-width: 1100px; margin: 0 auto; }
+    .page.active { display: block; }
+
+    /* ── Page header ──────────────────────────────────────────────── */
+    .page-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 4px;
+    }
+    .page-title {
+      font-size: 32px;
+      font-weight: 700;
+      color: #111827;
+      margin-bottom: 6px;
+    }
+    .page-subtitle {
+      font-size: 14px;
+      color: #6b7280;
+      margin-bottom: 24px;
+    }
+    .page-title-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    .auto-refresh-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 20px;
+      font-size: 13px;
+      color: #6b7280;
+      background: #fff;
+    }
+    .auto-refresh-badge svg { width: 14px; height: 14px; }
+
+    /* ── Service cards grid ───────────────────────────────────────── */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .service-card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 20px;
+      cursor: pointer;
+      transition: box-shadow 0.15s, transform 0.1s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .service-card:hover {
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+      transform: translateY(-1px);
+    }
+    .service-card.status-failed {
+      border-color: #fca5a5;
+      box-shadow: 0 0 0 2px rgba(239,68,68,0.15);
+    }
+    .card-name {
+      font-size: 16px;
+      font-weight: 700;
+      color: #111827;
+      margin-bottom: 4px;
+    }
+    .card-id {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-bottom: 14px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+    .status-pill svg { width: 18px; height: 18px; flex-shrink: 0; }
+    .status-pill.healthy {
+      background: #dcfce7;
+      color: #16a34a;
+    }
+    .status-pill.degraded {
+      background: #fef9c3;
+      color: #b45309;
+    }
+    .status-pill.failed {
+      background: #ef4444;
+      color: #ffffff;
+    }
+    .status-pill.unknown {
+      background: #f3f4f6;
+      color: #6b7280;
+    }
+    .status-sub {
+      font-size: 12px;
+      font-weight: 500;
+      opacity: 0.85;
+      margin-top: 2px;
+    }
+    .card-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: #9ca3af;
+    }
+    .card-latency { font-family: 'SF Mono', 'Fira Code', monospace; }
+
+    /* ── Detail page ──────────────────────────────────────────────── */
+    .back-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: #6b7280;
+      margin-bottom: 16px;
+      cursor: pointer;
+      width: fit-content;
+      padding: 4px 0;
+    }
+    .back-btn:hover { color: #111827; }
+    .back-btn svg { width: 14px; height: 14px; }
+    .detail-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .detail-title {
+      font-size: 28px;
+      font-weight: 700;
+      color: #111827;
+    }
+    .status-badge {
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .status-badge.healthy { background: #dcfce7; color: #16a34a; }
+    .status-badge.degraded { background: #fef9c3; color: #b45309; }
+    .status-badge.failed { background: #fee2e2; color: #dc2626; }
+    .status-badge.unknown { background: #f3f4f6; color: #6b7280; }
+    .detail-meta {
+      font-size: 13px;
+      color: #6b7280;
+      margin-bottom: 28px;
+    }
+
+    /* ── Tables ───────────────────────────────────────────────────── */
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 12px;
+      margin-top: 28px;
+    }
+    .section-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #111827;
+    }
+    .section-meta {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 1px solid #e5e7eb;
+    }
+    .data-table th {
+      background: #f9fafb;
+      padding: 10px 16px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      color: #6b7280;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .data-table td {
+      padding: 12px 16px;
+      font-size: 13px;
+      color: #374151;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    .data-table tr:last-child td { border-bottom: none; }
+    .data-table tr:hover td { background: #fafafa; }
+    .result-success { color: #16a34a; font-weight: 600; }
+    .result-failed { color: #dc2626; font-weight: 600; }
+    .latency-cell {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+    }
+    .outcome-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .outcome-badge.success { background: #dcfce7; color: #16a34a; }
+    .outcome-badge.failed { background: #fee2e2; color: #dc2626; }
+    .outcome-badge.delivered { background: #dcfce7; color: #16a34a; }
+    .empty-state {
+      text-align: center;
+      padding: 32px;
+      color: #9ca3af;
+      font-size: 13px;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+    }
+
+    /* ── Transition arrows (alerts) ───────────────────────────────── */
+    .transition-cell {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .t-healthy { color: #16a34a; }
+    .t-degraded { color: #d97706; }
+    .t-failed { color: #dc2626; }
+    .t-unknown { color: #9ca3af; }
+    .t-arrow { color: #9ca3af; font-size: 14px; }
+
+    /* ── Alerts page ──────────────────────────────────────────────── */
+    .alerts-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 16px 20px;
+    }
+    .stat-label {
+      font-size: 11px;
+      color: #6b7280;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 8px;
+    }
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: #111827;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .stat-value svg { width: 20px; height: 20px; }
+    .stat-value.ok { color: #16a34a; }
+    .stat-value.warn { color: #ef4444; }
+    .alerts-filters {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+      align-items: center;
+    }
+    .filter-select {
+      padding: 7px 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #374151;
+      background: #fff;
+      cursor: pointer;
+      outline: none;
+    }
+    .filter-clear {
+      font-size: 13px;
+      color: #6b7280;
+      cursor: pointer;
+      padding: 7px 12px;
+    }
+    .filter-clear:hover { color: #111827; }
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 12px;
+      margin-top: 20px;
+      font-size: 13px;
+      color: #6b7280;
+    }
+    .page-btn {
+      padding: 6px 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #fff;
+      font-size: 13px;
+      cursor: pointer;
+      color: #374151;
+    }
+    .page-btn:hover { background: #f3f4f6; }
+    .page-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Settings page ────────────────────────────────────────────── */
+    .settings-section {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .settings-section-title {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .settings-section-sub {
+      font-size: 13px;
+      color: #6b7280;
+      margin-bottom: 20px;
+    }
+    .settings-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #f3f4f6;
+      font-size: 14px;
+    }
+    .settings-row:last-child { border-bottom: none; }
+    .settings-row-label { color: #6b7280; }
+    .settings-row-value {
+      font-weight: 500;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 13px;
+    }
+    .settings-services-table { margin-top: 8px; }
+    .readonly-badge {
+      padding: 4px 10px;
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #6b7280;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .settings-note {
+      font-size: 13px;
+      color: #9ca3af;
+      text-align: center;
+      margin-top: 8px;
+    }
+    .two-col-settings {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    /* ── Footer ───────────────────────────────────────────────────── */
+    .footer {
+      text-align: center;
+      padding: 24px;
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 40px;
+    }
+
+    /* ── Loading spinner ──────────────────────────────────────────── */
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid #e5e7eb;
+      border-top-color: #6b7280;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error state ──────────────────────────────────────────────── */
+    .error-banner {
+      background: #fee2e2;
+      border: 1px solid #fca5a5;
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #dc2626;
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Auth overlay — shown when no API key in session -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-card">
+    <h2>Welcome to Vela</h2>
+    <p>Enter your Vela API key to access the dashboard.</p>
+    <label>API Key</label>
+    <input type="password" id="apiKeyInput" placeholder="vela-your-api-key"
+           autocomplete="off" />
+    <div class="auth-error" id="authError">Invalid API key. Please try again.</div>
+    <button class="btn-primary" onclick="handleAuth()">Connect</button>
+  </div>
+</div>
+
+<!-- Main app — hidden until authenticated -->
+<div id="app" style="display:none;">
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-logo">
+      <!-- Vela logo mark — overlapping rounded squares forming a V, dark charcoal -->
+      <div class="logo-icon">
+        <svg viewBox="0 0 40 40" fill="none">
+          <rect x="14.5" y="1" width="14" height="14" rx="4"
+                transform="rotate(45 14.5 1)" fill="#1a1a1a" opacity="0.25"/>
+          <rect x="1" y="14.5" width="14" height="14" rx="4"
+                transform="rotate(45 1 14.5)" fill="#1a1a1a" opacity="0.85"/>
+          <rect x="14.5" y="14.5" width="14" height="14" rx="4"
+                transform="rotate(45 14.5 14.5)" fill="#1a1a1a" opacity="0.4"/>
+        </svg>
+      </div>
+      Vela
+    </div>
+    <div class="header-summary" id="headerSummary">
+      <span class="summary-bold" id="summaryLine">Loading...</span>
+      <span>services healthy</span>
+    </div>
+    <nav class="header-nav">
+      <div class="nav-item active" data-page="dashboard" onclick="switchPage('dashboard', this)">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <rect x="1" y="1" width="6" height="6" rx="1"/>
+          <rect x="9" y="1" width="6" height="6" rx="1"/>
+          <rect x="1" y="9" width="6" height="6" rx="1"/>
+          <rect x="9" y="9" width="6" height="6" rx="1"/>
+        </svg>
+        Dashboard
+      </div>
+      <div class="nav-item" data-page="services" onclick="switchPage('services', this)">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1" y="3" width="14" height="10" rx="2"/>
+          <path d="M5 7h6M5 10h4"/>
+        </svg>
+        Services
+      </div>
+      <div class="nav-item" data-page="alerts" onclick="switchPage('alerts', this)">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M8 1a5 5 0 015 5v3l1.5 2.5H1.5L3 9V6a5 5 0 015-5z"/>
+          <path d="M6.5 13.5a1.5 1.5 0 003 0"/>
+        </svg>
+        Alerts
+      </div>
+      <div class="nav-item" data-page="settings" onclick="switchPage('settings', this)">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="8" cy="8" r="2.5"/>
+          <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41"/>
+        </svg>
+        Settings
+      </div>
+    </nav>
+    <div class="header-right">
+      <span id="lastRefresh">Last refresh: --:--:--</span>
+      <div class="live-indicator" id="liveIndicator">
+        <div class="live-dot"></div>
+        Live
+      </div>
+    </div>
+  </header>
+
+  <div class="error-banner" id="errorBanner">
+    Unable to reach Vela API. Check that Vela is running and your API key is correct.
+  </div>
+
+  <!-- ── DASHBOARD PAGE ─────────────────────────────────────────────── -->
+  <div class="page active" id="page-dashboard">
+    <div class="page-title-row">
+      <div>
+        <div class="page-label">SYSTEM OVERVIEW</div>
+        <div class="page-title">Service status</div>
+        <div class="page-subtitle">A real-time view of your connected Vela services.</div>
+      </div>
+      <div class="auto-refresh-badge">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M13.5 8A5.5 5.5 0 112.5 5.5"/>
+          <path d="M2.5 2v3.5H6"/>
+        </svg>
+        Auto-refreshing
+      </div>
+    </div>
+    <div class="cards-grid" id="cardsGrid">
+      <div style="color:#9ca3af;font-size:14px;">
+        <span class="spinner"></span> Loading services...
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SERVICES PAGE ──────────────────────────────────────────────── -->
+  <div class="page" id="page-services">
+    <div class="page-label">MONITORED SERVICES</div>
+    <div class="page-title">Services</div>
+    <div class="page-subtitle">All services currently registered in config.toml.</div>
+    <div class="cards-grid" id="servicesGrid">
+      <div style="color:#9ca3af;">Loading...</div>
+    </div>
+  </div>
+
+  <!-- ── DETAIL PAGE (injected dynamically) ────────────────────────── -->
+  <div class="page" id="page-detail">
+    <div class="back-btn" onclick="goBack()">
+      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M9 2L4 7l5 5"/>
+      </svg>
+      Back
+    </div>
+    <div class="detail-header">
+      <div class="detail-title" id="detailTitle">Service Name</div>
+      <div class="status-badge" id="detailBadge">Healthy</div>
+    </div>
+    <div class="detail-meta" id="detailMeta">Host: -- · Port: --</div>
+    <div id="detailContent">Loading...</div>
+  </div>
+
+  <!-- ── ALERTS PAGE ────────────────────────────────────────────────── -->
+  <div class="page" id="page-alerts">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;">
+      <div>
+        <div class="page-label">ALERT HISTORY</div>
+        <div class="page-title">Alerts</div>
+        <div class="page-subtitle">
+          A log of all status transitions and notification deliveries across your services.
+        </div>
+      </div>
+      <div class="alerts-filters">
+        <select class="filter-select" id="alertServiceFilter" onchange="filterAlerts()">
+          <option value="">All Services</option>
+        </select>
+        <select class="filter-select" id="alertStatusFilter" onchange="filterAlerts()">
+          <option value="">All Statuses</option>
+          <option value="delivered">Delivered</option>
+          <option value="failed">Failed</option>
+        </select>
+        <div class="filter-clear" onclick="clearFilters()">Clear filters</div>
+      </div>
+    </div>
+    <div class="alerts-stats" id="alertsStats">
+      <div class="stat-card">
+        <div class="stat-label">Total Alerts (24h)</div>
+        <div class="stat-value" id="statTotal">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Delivered</div>
+        <div class="stat-value ok" id="statDelivered">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Failed Deliveries</div>
+        <div class="stat-value warn" id="statFailed">—</div>
+      </div>
+    </div>
+    <div id="alertsTableContainer">Loading...</div>
+    <div class="pagination" id="alertsPagination" style="display:none;">
+      <button class="page-btn" id="prevPage" onclick="changePage(-1)">‹ Previous</button>
+      <span id="pageLabel">Page 1 of 1</span>
+      <button class="page-btn" id="nextPage" onclick="changePage(1)">Next ›</button>
+    </div>
+  </div>
+
+  <!-- ── SETTINGS PAGE ─────────────────────────────────────────────── -->
+  <div class="page" id="page-settings">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;">
+      <div>
+        <div class="page-label">CONFIGURATION</div>
+        <div class="page-title">Settings</div>
+        <div class="page-subtitle">
+          Read-only view of your current Vela configuration (config.toml).
+          Editing is not available in this version.
+        </div>
+      </div>
+      <div class="readonly-badge">
+        🔒 Read-only
+      </div>
+    </div>
+    <div id="settingsContent">Loading...</div>
+  </div>
+
+  <div class="footer">Vela v0.1.0 — auto-refreshes every 10 seconds.</div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────
+let API_KEY = '';
+let BASE_URL = window.location.origin;
+let currentPage = 'dashboard';
+let previousPage = 'dashboard';
+let allAlerts = [];
+let filteredAlerts = [];
+let alertPage = 1;
+const ALERTS_PER_PAGE = 10;
+let servicesData = {};  // id -> {config, state}
+let refreshTimer = null;
+
+// ── Auth ───────────────────────────────────────────────────────────────
+window.onload = () => {
+  const stored = sessionStorage.getItem('vela_api_key');
+  if (stored) {
+    API_KEY = stored;
+    document.getElementById('authOverlay').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    startApp();
+  }
+};
+
+async function handleAuth() {
+  const input = document.getElementById('apiKeyInput').value.trim();
+  if (!input) return;
+
+  // Test the key against the real API
+  try {
+    const res = await fetch(`${BASE_URL}/api/v1/status`, {
+      headers: { 'Authorization': `Bearer ${input}` }
+    });
+    if (res.ok) {
+      API_KEY = input;
+      sessionStorage.setItem('vela_api_key', input);
+      document.getElementById('authOverlay').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      startApp();
+    } else {
+      document.getElementById('authError').style.display = 'block';
+    }
+  } catch {
+    document.getElementById('authError').textContent =
+      'Cannot reach Vela API. Is Vela running on this host?';
+    document.getElementById('authError').style.display = 'block';
+  }
+}
+
+document.getElementById('apiKeyInput')
+  .addEventListener('keydown', e => { if (e.key === 'Enter') handleAuth(); });
+
+// ── API helpers ────────────────────────────────────────────────────────
+async function apiFetch(path) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { 'Authorization': `Bearer ${API_KEY}` }
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ── App startup ────────────────────────────────────────────────────────
+function startApp() {
+  refresh();
+  refreshTimer = setInterval(refresh, 10000);
+}
+
+async function refresh() {
+  try {
+    const data = await apiFetch('/api/v1/status');
+    const status = data.data;
+
+    updateHeader(status);
+    updateDashboard(status);
+    updateServices(status);
+
+    document.getElementById('lastRefresh').textContent =
+      'Last refresh: ' + new Date().toLocaleTimeString();
+    document.getElementById('liveIndicator').className = 'live-indicator';
+    document.getElementById('errorBanner').style.display = 'none';
+  } catch(e) {
+    document.getElementById('liveIndicator').className = 'live-indicator disconnected';
+    document.getElementById('errorBanner').style.display = 'block';
+  }
+}
+
+// ── Header summary ─────────────────────────────────────────────────────
+function updateHeader(status) {
+  document.getElementById('summaryLine').textContent =
+    `${status.healthy_count} of ${status.total_services}`;
+}
+
+// ── Dashboard cards ────────────────────────────────────────────────────
+function updateDashboard(status) {
+  const grid = document.getElementById('cardsGrid');
+  if (!status.services || status.services.length === 0) {
+    grid.innerHTML = '<div class="empty-state">No services configured.</div>';
+    return;
+  }
+  grid.innerHTML = status.services.map(s => renderCard(s)).join('');
+}
+
+function updateServices(status) {
+  const grid = document.getElementById('servicesGrid');
+  if (!status.services || status.services.length === 0) {
+    grid.innerHTML = '<div class="empty-state">No services configured.</div>';
+    return;
+  }
+  grid.innerHTML = status.services.map(s => renderCard(s)).join('');
+  // Cache service data for settings page
+  status.services.forEach(s => { servicesData[s.service_id] = s; });
+}
+
+function renderCard(s) {
+  const st = s.status.toLowerCase();
+  const timeAgo = s.last_checked_at ? timeAgoStr(s.last_checked_at) : 'Never';
+  const latency = '—';
+
+  let pillContent = '';
+  let icon = '';
+  let subtext = '';
+
+  if (st === 'healthy') {
+    icon = `<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="9" cy="9" r="7.5"/><path d="M5.5 9l2.5 2.5 4.5-4.5"/>
+    </svg>`;
+    pillContent = 'Healthy';
+  } else if (st === 'degraded') {
+    icon = `<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M9 2L16.5 15H1.5L9 2z"/><path d="M9 7v4M9 12.5v.5"/>
+    </svg>`;
+    pillContent = 'Degraded';
+    subtext = `${s.consecutive_failures} failure${s.consecutive_failures !== 1 ? 's' : ''}`;
+  } else if (st === 'failed') {
+    icon = `<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="9" cy="9" r="7.5"/><path d="M9 5v5M9 12.5v.5"/>
+    </svg>`;
+    pillContent = 'Failed';
+    subtext = `${s.consecutive_failures} failures · ${s.restart_count} restart${s.restart_count !== 1 ? 's' : ''}`;
+  } else {
+    icon = `<div class="spinner" style="border-color:#d1d5db;border-top-color:#9ca3af;"></div>`;
+    pillContent = 'Unknown';
+  }
+
+  const failedClass = st === 'failed' ? ' status-failed' : '';
+
+  return `<div class="service-card${failedClass}" onclick="openDetail('${s.service_id}')">
+    <div class="card-name">${escHtml(s.service_name)}</div>
+    <div class="card-id">${escHtml(s.service_id)}</div>
+    <div class="status-pill ${st}">
+      ${icon}
+      <div>
+        <div>${pillContent}</div>
+        ${subtext ? `<div class="status-sub">${subtext}</div>` : ''}
+      </div>
+    </div>
+    <div class="card-footer">
+      <span>Checked ${timeAgo}</span>
+      <span class="card-latency">${latency}</span>
+    </div>
+  </div>`;
+}
+
+// ── Detail page ────────────────────────────────────────────────────────
+async function openDetail(serviceId) {
+  previousPage = currentPage;
+  switchPage('detail', null);
+
+  try {
+    const [svcRes, checksRes, alertsRes, restartsRes] = await Promise.all([
+      apiFetch(`/api/v1/services/${serviceId}`),
+      apiFetch(`/api/v1/services/${serviceId}/checks`),
+      apiFetch(`/api/v1/services/${serviceId}/alerts`),
+      apiFetch(`/api/v1/services/${serviceId}/restarts`),
+    ]);
+
+    const svc = svcRes.data;
+    const checks = checksRes.data;
+    const alerts = alertsRes.data;
+    const restarts = restartsRes.data;
+
+    // Header
+    document.getElementById('detailTitle').textContent = svc.service_name;
+    const badge = document.getElementById('detailBadge');
+    badge.textContent = svc.status;
+    badge.className = `status-badge ${svc.status.toLowerCase()}`;
+    document.getElementById('detailMeta').textContent =
+      `Host: ${svc.service_id}  ·  Restarts: ${svc.restart_count}  ·  Failures: ${svc.consecutive_failures}`;
+
+    // Health checks table
+    const checksHtml = checks.length === 0
+      ? '<div class="empty-state">No health check records yet.</div>'
+      : `<table class="data-table">
+          <thead><tr>
+            <th>TIMESTAMP</th><th>RESULT</th>
+            <th>LATENCY (MS)</th><th>ERROR MESSAGE</th>
+          </tr></thead>
+          <tbody>
+            ${checks.slice().reverse().slice(0, 10).map(c => `<tr>
+              <td>${fmtTime(c.checked_at)}</td>
+              <td class="${c.success ? 'result-success' : 'result-failed'}">
+                ${c.success ? '✓ Success' : '✗ Failed'}
+              </td>
+              <td class="latency-cell">${c.success ? c.latency_ms : '—'}</td>
+              <td style="color:#9ca3af;">${escHtml(c.error || '—')}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`;
+
+    // Alerts table
+    const alertsHtml = alerts.length === 0
+      ? '<div class="empty-state">No alerts recorded yet.</div>'
+      : `<table class="data-table">
+          <thead><tr>
+            <th>TIMESTAMP</th><th>TRANSITION</th><th>DELIVERY STATUS</th>
+          </tr></thead>
+          <tbody>
+            ${alerts.slice().reverse().slice(0, 5).map(a => `<tr>
+              <td>${fmtTime(a.sent_at)}</td>
+              <td>${renderTransition(a.trigger)}</td>
+              <td><span class="outcome-badge ${a.delivered ? 'delivered' : 'failed'}">
+                ${a.delivered ? 'Delivered' : 'Failed'}
+              </span></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`;
+
+    // Restarts table
+    const restartsHtml = restarts.length === 0
+      ? '<div class="empty-state">No restart attempts recorded.</div>'
+      : `<table class="data-table">
+          <thead><tr>
+            <th>TIMESTAMP</th><th>ATTEMPT NUMBER</th><th>OUTCOME</th>
+          </tr></thead>
+          <tbody>
+            ${restarts.slice().reverse().slice(0, 5).map(r => `<tr>
+              <td>${fmtTime(r.attempted_at)}</td>
+              <td>${r.attempt_number}</td>
+              <td><span class="outcome-badge ${r.succeeded ? 'success' : 'failed'}">
+                ${r.succeeded ? 'Success' : 'Failed'}
+              </span></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`;
+
+    document.getElementById('detailContent').innerHTML = `
+      <div class="section-header">
+        <div class="section-title">Recent Health Checks</div>
+        <div class="section-meta">Last 10 checks</div>
+      </div>
+      ${checksHtml}
+      <div class="section-header">
+        <div class="section-title">Recent Alerts</div>
+        <div class="section-meta">Last 5 alerts</div>
+      </div>
+      ${alertsHtml}
+      <div class="section-header">
+        <div class="section-title">Recent Restarts</div>
+        <div class="section-meta">Last 5 restart attempts</div>
+      </div>
+      ${restartsHtml}
+    `;
+  } catch(e) {
+    document.getElementById('detailContent').innerHTML =
+      '<div class="empty-state">Failed to load service details.</div>';
+  }
+}
+
+function goBack() { switchPage(previousPage, document.querySelector(`[data-page="${previousPage}"]`)); }
+
+// ── Alerts page ────────────────────────────────────────────────────────
+async function loadAlerts() {
+  try {
+    const statusRes = await apiFetch('/api/v1/status');
+    const services = statusRes.data.services;
+
+    allAlerts = [];
+    let total = 0, delivered = 0, failed = 0;
+
+    // Populate service filter
+    const serviceFilter = document.getElementById('alertServiceFilter');
+    serviceFilter.innerHTML = '<option value="">All Services</option>';
+    services.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.service_id;
+      opt.textContent = s.service_name;
+      serviceFilter.appendChild(opt);
+    });
+
+    // Fetch alerts for each service
+    for (const svc of services) {
+      try {
+        const alertsRes = await apiFetch(`/api/v1/services/${svc.service_id}/alerts`);
+        const svcAlerts = alertsRes.data.map(a => ({ ...a, service_name: svc.service_name }));
+        allAlerts.push(...svcAlerts);
+        total += svcAlerts.length;
+        delivered += svcAlerts.filter(a => a.delivered).length;
+        failed += svcAlerts.filter(a => !a.delivered).length;
+      } catch {}
+    }
+
+    // Sort by most recent
+    allAlerts.sort((a, b) => new Date(b.sent_at) - new Date(a.sent_at));
+
+    // Stats
+    document.getElementById('statTotal').textContent = total;
+    document.getElementById('statDelivered').textContent = delivered;
+    document.getElementById('statFailed').textContent = failed;
+
+    filterAlerts();
+  } catch {
+    document.getElementById('alertsTableContainer').innerHTML =
+      '<div class="empty-state">Failed to load alerts.</div>';
+  }
+}
+
+function filterAlerts() {
+  const svcFilter = document.getElementById('alertServiceFilter').value;
+  const stFilter = document.getElementById('alertStatusFilter').value;
+
+  filteredAlerts = allAlerts.filter(a => {
+    if (svcFilter && a.service_id !== svcFilter) return false;
+    if (stFilter === 'delivered' && !a.delivered) return false;
+    if (stFilter === 'failed' && a.delivered) return false;
+    return true;
+  });
+
+  alertPage = 1;
+  renderAlertsTable();
+}
+
+function clearFilters() {
+  document.getElementById('alertServiceFilter').value = '';
+  document.getElementById('alertStatusFilter').value = '';
+  filterAlerts();
+}
+
+function renderAlertsTable() {
+  const start = (alertPage - 1) * ALERTS_PER_PAGE;
+  const pageAlerts = filteredAlerts.slice(start, start + ALERTS_PER_PAGE);
+  const totalPages = Math.max(1, Math.ceil(filteredAlerts.length / ALERTS_PER_PAGE));
+
+  if (filteredAlerts.length === 0) {
+    document.getElementById('alertsTableContainer').innerHTML =
+      '<div class="empty-state">No alerts match the current filters.</div>';
+    document.getElementById('alertsPagination').style.display = 'none';
+    return;
+  }
+
+  document.getElementById('alertsTableContainer').innerHTML =
+    `<table class="data-table">
+      <thead><tr>
+        <th>TIMESTAMP</th><th>SERVICE</th>
+        <th>TRANSITION</th><th>DELIVERY STATUS</th>
+      </tr></thead>
+      <tbody>
+        ${pageAlerts.map(a => `<tr>
+          <td>${fmtTime(a.sent_at)}</td>
+          <td>
+            <div style="font-weight:600;">${escHtml(a.service_name || a.service_id)}</div>
+            <div style="font-size:11px;color:#9ca3af;font-family:monospace;">${escHtml(a.service_id)}</div>
+          </td>
+          <td>${renderTransition(a.trigger)}</td>
+          <td><span class="outcome-badge ${a.delivered ? 'delivered' : 'failed'}">
+            ${a.delivered ? 'Delivered' : 'Failed'}
+          </span></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+
+  document.getElementById('alertsPagination').style.display = 'flex';
+  document.getElementById('pageLabel').textContent =
+    `Page ${alertPage} of ${totalPages}`;
+  document.getElementById('prevPage').disabled = alertPage === 1;
+  document.getElementById('nextPage').disabled = alertPage === totalPages;
+}
+
+function changePage(dir) {
+  alertPage += dir;
+  renderAlertsTable();
+}
+
+// ── Settings page ──────────────────────────────────────────────────────
+async function loadSettings() {
+  try {
+    const statusRes = await apiFetch('/api/v1/status');
+    const status = statusRes.data;
+
+    const servicesRows = status.services.map(s => `<tr>
+      <td>
+        <div style="font-weight:600;">${escHtml(s.service_name)}</div>
+        <div style="font-size:11px;color:#9ca3af;font-family:monospace;">${escHtml(s.service_id)}</div>
+      </td>
+      <td class="latency-cell" style="color:#374151;">—</td>
+      <td style="color:#374151;">—</td>
+      <td style="color:#374151;">—</td>
+      <td><span class="status-badge ${s.status.toLowerCase()}">${escHtml(s.status)}</span></td>
+    </tr>`).join('');
+
+    document.getElementById('settingsContent').innerHTML = `
+      <div class="settings-section">
+        <div class="settings-section-title">General</div>
+        <div class="settings-section-sub">Core runtime configuration</div>
+        <div class="settings-row">
+          <div class="settings-row-label">Config file path</div>
+          <div class="settings-row-value">/etc/vela/config.toml</div>
+        </div>
+        <div class="settings-row">
+          <div class="settings-row-label">Refresh interval</div>
+          <div class="settings-row-value">10s</div>
+        </div>
+        <div class="settings-row">
+          <div class="settings-row-label">Vela version</div>
+          <div class="settings-row-value">v0.1.0</div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title">Monitored Services</div>
+        <div class="settings-section-sub">
+          Services currently registered in config.toml
+        </div>
+        <table class="data-table settings-services-table">
+          <thead><tr>
+            <th>SERVICE</th><th>HOST:PORT</th>
+            <th>CHECK INTERVAL</th><th>FAILURE THRESHOLD</th><th>STATE</th>
+          </tr></thead>
+          <tbody>${servicesRows}</tbody>
+        </table>
+      </div>
+
+      <div class="two-col-settings">
+        <div class="settings-section">
+          <div class="settings-section-title">Alerting</div>
+          <div class="settings-section-sub">Notification delivery settings</div>
+          <div class="settings-row">
+            <div class="settings-row-label">Notification channel</div>
+            <div class="settings-row-value">Log + Webhook</div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-label">Destination URL</div>
+            <div class="settings-row-value" style="font-size:12px;">— (see config.toml)</div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-label">Retry policy</div>
+            <div class="settings-row-value">Per-service, see config.toml</div>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-section-title">Recovery</div>
+          <div class="settings-section-sub">Automatic restart behavior</div>
+          <div class="settings-row">
+            <div class="settings-row-label">Restart policy enabled</div>
+            <div class="settings-row-value">
+              <span class="outcome-badge success">Per-service</span>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-label">Max restart attempts</div>
+            <div class="settings-row-value">See config.toml</div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-label">Cooldown period</div>
+            <div class="settings-row-value">Exponential backoff</div>
+          </div>
+        </div>
+      </div>
+      <div class="settings-note">
+        To modify these settings, edit config.toml directly and restart Vela.
+      </div>
+    `;
+  } catch {
+    document.getElementById('settingsContent').innerHTML =
+      '<div class="empty-state">Failed to load settings.</div>';
+  }
+}
+
+// ── Page routing ───────────────────────────────────────────────────────
+function switchPage(pageId, navEl) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+
+  document.getElementById(`page-${pageId}`).classList.add('active');
+  if (navEl) navEl.classList.add('active');
+
+  previousPage = currentPage;
+  currentPage = pageId;
+
+  if (pageId === 'alerts') loadAlerts();
+  if (pageId === 'settings') loadSettings();
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function timeAgoStr(isoStr) {
+  const diff = Math.floor((Date.now() - new Date(isoStr)) / 1000);
+  if (diff < 0) return 'just now';
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
+}
+
+function fmtTime(isoStr) {
+  if (!isoStr) return '—';
+  const d = new Date(isoStr);
+  const today = new Date();
+  const isToday = d.toDateString() === today.toDateString();
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return isToday ? `Today, ${time}` : d.toLocaleDateString() + ' ' + time;
+}
+
+function renderTransition(trigger) {
+  if (!trigger) return '—';
+  // Server format: "Healthy→Failed" (Rust {:?} Debug formatting joined by an arrow)
+  const parts = trigger.split('→');
+  if (parts.length !== 2) return escHtml(trigger);
+  const [from, to] = parts;
+  return `<div class="transition-cell">
+    <span class="t-${from.toLowerCase()}">${escHtml(from)}</span>
+    <span class="t-arrow">→</span>
+    <span class="t-${to.toLowerCase()}">${escHtml(to)}</span>
+  </div>`;
+}
+</script>
+</body>
+</html>
