@@ -65,6 +65,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # This crate provides ConstantTimeEq that compares in fixed time.
 subtle = "2"
 
+# bollard: the de-facto Rust Docker API client. Talks to the Docker daemon
+# over a Unix socket (Linux), named pipe (Windows), or TCP — the stdlib and
+# every other existing dependency have no Docker client capability at all.
+# Its image-pull API returns a Stream, consumed via the already-present
+# tokio-stream dependency's StreamExt — no separate futures crate needed.
+bollard = "0.17"
+
 [dev-dependencies]
 # HTTP test server for integration tests
 mockito = "1"

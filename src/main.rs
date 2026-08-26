@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 mod alert;
 mod api;
 mod config;
+mod docker_engine;
 mod error;
 mod health;
 mod models;
@@ -83,8 +84,33 @@ async fn main() {
         vela_config.services.len()
     );
 
-    // Start the health engine — one async task per configured service.
-    let health_handle = match health::run(state.clone(), vela_config.services.clone()).await {
+    // Connect to Docker, if available. This is never fatal — Docker is an
+    // optional capability. Manual-mode and none-mode services are entirely
+    // unaffected if the daemon is unreachable; only restart.mode = "docker"
+    // services will log an error the next time they need to restart.
+    let docker_client = match docker_engine::connect().await {
+        Ok(client) => {
+            tracing::info!("Docker engine: connected to Docker daemon.");
+            Some(client)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Docker engine: cannot connect to Docker daemon — Docker features disabled."
+            );
+            tracing::warn!("Docker engine: if you are using restart.mode = \"docker\", ensure Docker is running.");
+            tracing::warn!("Docker engine: {}", e);
+            None
+        }
+    };
+
+    // Start the health engine — one async task per configured upstream.
+    let health_handle = match health::run(
+        state.clone(),
+        vela_config.services.clone(),
+        docker_client.clone(),
+    )
+    .await
+    {
         Ok(handle) => {
             tracing::info!("Health engine started successfully.");
             handle
@@ -96,7 +122,13 @@ async fn main() {
     };
 
     // Start the recovery engine — polls for Failed services and restarts them.
-    let recovery_handle = match recovery::run(state.clone(), vela_config.services.clone()).await {
+    let recovery_handle = match recovery::run(
+        state.clone(),
+        vela_config.services.clone(),
+        docker_client.clone(),
+    )
+    .await
+    {
         Ok(handle) => {
             tracing::info!("Recovery engine started successfully.");
             handle
@@ -156,7 +188,22 @@ async fn main() {
         }
     };
 
-    tracing::info!("Vela is running. Press Ctrl+C to stop.");
+    let upstream_count: usize = vela_config.services.iter().map(|s| s.upstreams.len()).sum();
+    tracing::info!("Vela is running.");
+    tracing::info!(
+        "Docker support: {}",
+        if docker_client.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    tracing::info!(
+        "Monitoring {} service(s) across {} upstream(s)",
+        vela_config.services.len(),
+        upstream_count
+    );
+    tracing::info!("Press Ctrl+C to stop.");
     tracing::info!("Set RUST_LOG=debug for per-check verbose output.");
 
     // Wait for shutdown signal

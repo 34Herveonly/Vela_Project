@@ -1,6 +1,21 @@
 # Vela configuration file
 # Copy this to config.toml and edit to match your services.
 # Run: vela config.toml
+#
+# Vela supports three ways to configure how a service is restarted, and you
+# can mix all three in the same file:
+#   - manual : run a shell command (systemd, custom scripts, anything)
+#   - docker : restart (or repull + recreate) a Docker container by name
+#   - none   : monitor and alert only — for services Vela cannot control
+#     (external APIs, managed cloud backends)
+#
+# A service can also have multiple [[services.upstreams]] entries for
+# automatic health-aware failover across replicas — see Example 3.
+#
+# Backward compatibility: the old `host` / `port` / `command` fields still
+# work exactly as before. If you have an existing config.toml, you do not
+# need to change anything — Vela synthesizes the new `upstreams` and
+# `restart` structures from those fields automatically at load time.
 
 [global]
 # Port for Vela's REST API. Default: 7700.
@@ -14,8 +29,10 @@ api_key = "change-me-to-a-strong-secret"
 # Directory for Vela log files.
 log_dir = "/var/log/vela"
 
-# ─── Service definitions ────────────────────────────────────────────────────
-# Add one [[services]] block per service you want Vela to monitor.
+# ═══════════════════════════════════════════════════════════════════════════
+# Example 1 — Manual mode (backward compatible, pre-Phase-8 syntax)
+# The classic case: a service on bare metal/VPS restarted via systemd.
+# ═══════════════════════════════════════════════════════════════════════════
 
 [[services]]
 # Unique ID — lowercase letters, numbers, hyphens only.
@@ -24,8 +41,7 @@ name = "Authentication Service"
 host = "127.0.0.1"
 port = 3001
 
-# Command to restart this service if it fails.
-# Comment out if Vela should monitor-only (no auto-restart).
+# Command to restart this service if it fails. Old syntax — still works.
 command = "systemctl restart auth-service"
 
 # How often to run the health check (seconds).
@@ -55,22 +71,109 @@ enabled = true
 kind = "log"
 enabled = true
 
-# ─── Second service example ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Example 2 — Docker mode (single container, monolith)
+# One service = one container = one restart target. Vela calls the Docker
+# API directly — no shell command needed.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[services]]
+id = "my-app"
+name = "My Application"
+check_interval_secs = 10
+failure_threshold = 3
+max_restarts = 5
+
+[services.health_check]
+kind = "http"
+http_path = "/health"
+timeout_ms = 3000
+
+[services.restart]
+mode = "docker"
+
+[services.restart.docker]
+container = "my-app-container"
+# image = "mycompany/app:latest"  # uncomment to enable repull on restart —
+                                   # pulls the image, recreates the container
+                                   # with the same name and port bindings.
+
+[services.proxy]
+listen_port = 8080
+
+[[services.upstreams]]
+host = "127.0.0.1"
+port = 8001
+docker_container = "my-app-container"
+
+[[services.alerts]]
+kind = "webhook"
+endpoint = "https://your-webhook.example.com/vela"
+enabled = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Example 3 — Docker mode (microservices, multi-upstream failover)
+# Two replicas of the same service. The proxy routes only to Healthy
+# upstreams — if payment-primary dies, traffic shifts automatically to
+# payment-replica with zero configuration change.
+# ═══════════════════════════════════════════════════════════════════════════
 
 [[services]]
 id = "payment-service"
 name = "Payment Service"
-host = "127.0.0.1"
-port = 3002
-command = "systemctl restart payment-service"
-check_interval_secs = 15
+check_interval_secs = 10
 failure_threshold = 2
 max_restarts = 3
 
 [services.health_check]
-# TCP check — just verifies the port accepts connections.
-kind = "tcp"
-timeout_ms = 2000
+kind = "http"
+http_path = "/health"
+timeout_ms = 3000
+
+[services.restart]
+mode = "docker"
+
+[services.restart.docker]
+container = "payment-primary"
+
+[services.proxy]
+listen_port = 9001
+
+[[services.upstreams]]
+host = "127.0.0.1"
+port = 3002
+docker_container = "payment-primary"
+
+[[services.upstreams]]
+host = "127.0.0.1"
+port = 3003
+docker_container = "payment-replica"
+
+[[services.alerts]]
+kind = "log"
+enabled = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Example 4 — Monitor only (external service, no restart)
+# For services Vela cannot control — a managed cloud backend, a third-party
+# API. Vela still checks health and fires alerts; it just never restarts.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[services]]
+id = "gcp-backend"
+name = "GCP Backend Service"
+host = "34.35.143.220"
+port = 8080
+check_interval_secs = 30
+failure_threshold = 3
+
+[services.health_check]
+kind = "http"
+http_path = "/health"
+timeout_ms = 5000
+
+[services.restart]
+mode = "none"
 
 [[services.alerts]]
 kind = "log"
