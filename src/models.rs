@@ -7,6 +7,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::VelaError;
+
 // ─── Configuration Models ────────────────────────────────────────────────────
 // These are parsed from config.toml and are IMMUTABLE after startup.
 // They represent what the user declared, not what Vela observed.
@@ -59,15 +61,36 @@ pub struct ServiceConfig {
     pub name: String,
 
     /// Hostname or IP of the service.
-    pub host: String,
+    /// Optional as of Phase 8: a service defined entirely through
+    /// `[[services.upstreams]]` (the Docker multi-upstream pattern) has no
+    /// single host — see `upstreams` below. When present alongside an empty
+    /// `upstreams` list, the config engine synthesizes a single upstream
+    /// from `host`/`port` at load time — no other code reads these two
+    /// fields directly.
+    pub host: Option<String>,
 
-    /// Port the service listens on.
-    pub port: u16,
+    /// Port the service listens on. See `host` above — same Optional/synthesis rule.
+    pub port: Option<u16>,
 
     /// Shell command to restart the service if it fails.
     /// Optional — if absent, Vela monitors but cannot restart.
     /// Example: "systemctl restart auth-service"
+    /// Superseded by `restart` below when present; kept for backward
+    /// compatibility — the config engine synthesizes a `restart` block
+    /// with `mode = "manual"` from this field when `restart` is absent.
     pub command: Option<String>,
+
+    /// One or more upstream instances for this service. Optional in config —
+    /// when absent/empty, the config engine synthesizes a single entry from
+    /// `host`/`port` at load time, so every other engine can always assume
+    /// this is non-empty after startup and never touch `host`/`port` again.
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamConfig>,
+
+    /// How Vela restarts this service on failure. Optional in config — when
+    /// absent, the config engine synthesizes one from `command` (manual mode)
+    /// or, if `command` is also absent, `RestartMode::None` (monitor only).
+    pub restart: Option<RestartConfig>,
 
     /// How often to run the health check, in seconds. Default: 10.
     #[serde(default = "default_check_interval")]
@@ -100,6 +123,115 @@ fn default_failure_threshold() -> u32 {
 }
 fn default_max_restarts() -> u32 {
     5
+}
+
+/// How Vela restarts a service that has crossed its failure threshold.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RestartMode {
+    /// Restart via the Docker API — no shell command, targets a container by name.
+    Docker,
+    /// Restart via a shell command (`sh -c <command>`) — the Phase 3 behavior.
+    Manual,
+    /// Monitor and alert only. Never attempt a restart. For services Vela
+    /// cannot control (external APIs, managed cloud backends).
+    None,
+}
+
+/// Docker-specific restart parameters. Required when `RestartMode::Docker`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DockerConfig {
+    /// Name of the Docker container to restart. Must match exactly.
+    pub container: String,
+
+    /// If present, pull this image before restarting (CI/CD "repull" behavior):
+    /// stop the old container, remove it, recreate it from the freshly pulled
+    /// image with the same name and port bindings, then start it.
+    /// If absent, Vela just calls the Docker restart API on the existing container.
+    pub image: Option<String>,
+
+    /// Docker socket path override. Default: /var/run/docker.sock (Linux) or
+    /// the platform-appropriate named pipe on Windows — see docker_engine::connect().
+    pub socket_path: Option<String>,
+}
+
+/// How a single service is restarted on failure.
+/// Synthesized from the legacy `command` field when absent — see config.rs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RestartConfig {
+    pub mode: RestartMode,
+
+    /// Shell command to run. Required when `mode = "manual"`.
+    pub command: Option<String>,
+
+    /// Docker restart parameters. Required when `mode = "docker"`.
+    pub docker: Option<DockerConfig>,
+}
+
+impl RestartConfig {
+    /// Validates that the fields required by `mode` are actually present.
+    /// Called by the config engine for every service after synthesis, so
+    /// this runs even for configs that never wrote a `[services.restart]`
+    /// block at all.
+    pub fn validate(&self, service_id: &str) -> Result<(), VelaError> {
+        match self.mode {
+            RestartMode::Docker if self.docker.is_none() => Err(VelaError::ConfigValidation(
+                format!(
+                    "Service '{}' has restart.mode = \"docker\" but no [services.restart.docker] block",
+                    service_id
+                ),
+            )),
+            RestartMode::Manual if self.command.is_none() => Err(VelaError::ConfigValidation(
+                format!(
+                    "Service '{}' has restart.mode = \"manual\" but restart.command is not set",
+                    service_id
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// One upstream instance for a service. A service with multiple upstreams
+/// (e.g. two replicas of the same microservice) gets automatic health-aware
+/// failover: the proxy only routes to upstreams currently Healthy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UpstreamConfig {
+    pub host: String,
+    pub port: u16,
+
+    /// If set, this upstream's container identity for Docker-aware health
+    /// checks: the health engine additionally verifies the container is
+    /// running (not just that the TCP/HTTP check passes).
+    pub docker_container: Option<String>,
+}
+
+/// Live health status of one upstream instance. Runtime state, not config —
+/// mirrors `ServiceState` but scoped to a single upstream within a service.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpstreamState {
+    pub host: String,
+    pub port: u16,
+    pub status: ServiceStatus,
+    pub consecutive_failures: u32,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    pub latency_ms: Option<u64>,
+}
+
+impl UpstreamState {
+    /// Creates the initial unknown state for an upstream at startup.
+    pub fn initial(host: String, port: u16) -> Self {
+        Self {
+            host,
+            port,
+            status: ServiceStatus::Unknown,
+            consecutive_failures: 0,
+            last_checked_at: None,
+            last_ok_at: None,
+            latency_ms: None,
+        }
+    }
 }
 
 /// The type and parameters of a health check for a service.
@@ -215,8 +347,10 @@ pub struct ProxyBinding {
     pub service_name: String,
     /// The socket address Vela listens on (e.g., "127.0.0.1:8001").
     pub listen_addr: String,
-    /// The upstream address to forward to (e.g., "127.0.0.1:3001").
-    pub upstream_addr: String,
+    /// All configured upstream addresses for this service (e.g.
+    /// ["127.0.0.1:3001", "127.0.0.1:3002"]). The proxy round-robins across
+    /// whichever of these are currently Healthy — see state.get_healthy_upstreams.
+    pub upstream_addrs: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -522,4 +656,77 @@ pub struct VelaStatusResponse {
     pub total_services: usize,
     /// Full summary list of all monitored services.
     pub services: Vec<ServiceSummary>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_config_validate_ok_for_manual_with_command() {
+        let cfg = RestartConfig {
+            mode: RestartMode::Manual,
+            command: Some("systemctl restart x".to_string()),
+            docker: None,
+        };
+        assert!(cfg.validate("svc").is_ok());
+    }
+
+    #[test]
+    fn restart_config_validate_fails_for_manual_without_command() {
+        let cfg = RestartConfig {
+            mode: RestartMode::Manual,
+            command: None,
+            docker: None,
+        };
+        let err = cfg.validate("svc").unwrap_err();
+        assert!(matches!(err, VelaError::ConfigValidation(_)));
+    }
+
+    #[test]
+    fn restart_config_validate_ok_for_docker_with_docker_block() {
+        let cfg = RestartConfig {
+            mode: RestartMode::Docker,
+            command: None,
+            docker: Some(DockerConfig {
+                container: "my-container".to_string(),
+                image: None,
+                socket_path: None,
+            }),
+        };
+        assert!(cfg.validate("svc").is_ok());
+    }
+
+    #[test]
+    fn restart_config_validate_fails_for_docker_without_docker_block() {
+        let cfg = RestartConfig {
+            mode: RestartMode::Docker,
+            command: None,
+            docker: None,
+        };
+        let err = cfg.validate("svc").unwrap_err();
+        assert!(matches!(err, VelaError::ConfigValidation(_)));
+    }
+
+    #[test]
+    fn restart_config_validate_ok_for_none_mode_regardless_of_fields() {
+        let cfg = RestartConfig {
+            mode: RestartMode::None,
+            command: None,
+            docker: None,
+        };
+        assert!(cfg.validate("svc").is_ok());
+    }
+
+    #[test]
+    fn upstream_state_initial_starts_unknown_with_no_history() {
+        let state = UpstreamState::initial("127.0.0.1".to_string(), 8080);
+        assert_eq!(state.host, "127.0.0.1");
+        assert_eq!(state.port, 8080);
+        assert_eq!(state.status, ServiceStatus::Unknown);
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.last_checked_at.is_none());
+        assert!(state.last_ok_at.is_none());
+        assert!(state.latency_ms.is_none());
+    }
 }

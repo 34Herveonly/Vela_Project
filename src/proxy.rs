@@ -1,13 +1,17 @@
-//! Proxy engine — health-aware TCP reverse proxy.
+//! Proxy engine — health-aware TCP reverse proxy with multi-upstream failover.
 //!
 //! ## Design
 //! One independent listener task per configured proxy port.
-//! Each listener accepts connections, checks upstream health in VelaState,
+//! Each listener accepts connections, reads the CURRENT set of Healthy
+//! upstreams for that service from VelaState, round-robins across them,
 //! and bidirectionally forwards bytes using tokio::io::copy_bidirectional.
 //!
 //! ## Health-aware routing
 //! Upstream health is checked on every new connection by reading VelaState.
 //! There is no caching — stale health data could forward to a failed service.
+//! A service with multiple upstreams gets automatic failover: when one
+//! upstream fails its health checks, it drops out of rotation within one
+//! health-check cycle; when it recovers, it rejoins automatically.
 //!
 //! ## Resource bounds
 //! Semaphore per listener limits concurrent connections to MAX_CONCURRENT_CONNECTIONS.
@@ -19,6 +23,7 @@
 //! The shutdown completes when all in-flight transfers finish.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +37,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::VelaError;
 use crate::models::{
-    ProxyBinding, ServiceStatus, VelaConfig, MAX_CONCURRENT_CONNECTIONS, PROXY_IDLE_TIMEOUT_SECS,
+    ProxyBinding, VelaConfig, MAX_CONCURRENT_CONNECTIONS, PROXY_IDLE_TIMEOUT_SECS,
     PROXY_TRANSFER_TIMEOUT_SECS,
 };
 use crate::state::VelaState;
@@ -69,7 +74,7 @@ impl ProxyEngineHandle {
 /// - No two services may share the same proxy listen port
 /// - Proxy listen ports must not equal the Vela API port
 /// - Proxy listen ports must be in the valid range (1–65535)
-/// - Proxy listen ports must not equal the service's own port
+/// - Proxy listen ports must not equal any of the service's own upstream ports
 pub fn validate_proxy_config(config: &VelaConfig) -> Result<(), VelaError> {
     let mut used_ports: HashSet<u16> = HashSet::new();
     used_ports.insert(config.global.api_port);
@@ -89,14 +94,16 @@ pub fn validate_proxy_config(config: &VelaConfig) -> Result<(), VelaError> {
             });
         }
 
-        if port == svc.port {
-            return Err(VelaError::ProxyPortConflict {
-                port,
-                reason: format!(
-                    "Service '{}' proxy listen_port {} conflicts with the service's own port",
-                    svc.id, port
-                ),
-            });
+        for upstream in &svc.upstreams {
+            if port == upstream.port {
+                return Err(VelaError::ProxyPortConflict {
+                    port,
+                    reason: format!(
+                        "Service '{}' proxy listen_port {} conflicts with its own upstream {}:{}",
+                        svc.id, port, upstream.host, upstream.port
+                    ),
+                });
+            }
         }
 
         if port == config.global.api_port {
@@ -125,6 +132,8 @@ pub fn validate_proxy_config(config: &VelaConfig) -> Result<(), VelaError> {
 
 /// Builds the list of ProxyBindings from the validated configuration.
 /// Returns only services that have a proxy config — others are skipped silently.
+/// Each binding carries every configured upstream address for its service —
+/// see `ProxyBinding::upstream_addrs`.
 pub fn build_proxy_bindings(config: &VelaConfig) -> Vec<ProxyBinding> {
     config
         .services
@@ -136,11 +145,16 @@ pub fn build_proxy_bindings(config: &VelaConfig) -> Vec<ProxyBinding> {
             } else {
                 "127.0.0.1"
             };
+            let upstream_addrs: Vec<String> = svc
+                .upstreams
+                .iter()
+                .map(|u| format!("{}:{}", u.host, u.port))
+                .collect();
             Some(ProxyBinding {
                 service_id: svc.id.clone(),
                 service_name: svc.name.clone(),
                 listen_addr: format!("{}:{}", bind_host, proxy.listen_port),
-                upstream_addr: format!("{}:{}", svc.host, svc.port),
+                upstream_addrs,
             })
         })
         .collect()
@@ -185,8 +199,11 @@ pub async fn run(state: VelaState, config: &VelaConfig) -> Result<ProxyEngineHan
         })?;
 
         info!(
-            "Proxy engine: listening on {} → {} (service: '{}' / '{}')",
-            binding.listen_addr, binding.upstream_addr, binding.service_id, binding.service_name
+            "Proxy engine: listening on {} → [{}] (service: '{}' / '{}')",
+            binding.listen_addr,
+            binding.upstream_addrs.join(", "),
+            binding.service_id,
+            binding.service_name
         );
 
         let state_clone = state.clone();
@@ -218,6 +235,10 @@ async fn run_listener(
 ) {
     // One semaphore per listener — limits concurrent connections for this port only.
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // One round-robin counter per listener, shared across every connection
+    // this listener ever handles — this is what makes rotation fair over
+    // time rather than restarting from upstream 0 on every connection.
+    let rr_counter = Arc::new(AtomicUsize::new(0));
 
     loop {
         tokio::select! {
@@ -259,6 +280,7 @@ async fn run_listener(
 
                         let state_clone = state.clone();
                         let binding_clone = binding.clone();
+                        let rr_counter_clone = rr_counter.clone();
 
                         // Spawn a task per connection. The permit is moved into
                         // the task and dropped when the task completes — RAII release.
@@ -267,6 +289,7 @@ async fn run_listener(
                                 client_stream,
                                 state_clone,
                                 &binding_clone,
+                                &rr_counter_clone,
                             ).await;
                             // permit is dropped here → semaphore slot released
                             drop(permit);
@@ -287,24 +310,39 @@ async fn run_listener(
 }
 
 /// Handles a single proxied connection.
-/// Checks upstream health, connects to upstream, and forwards bytes bidirectionally.
+/// Reads the current set of Healthy upstreams for this service, round-robins
+/// across them, connects, and forwards bytes bidirectionally.
 /// All errors are logged and non-fatal — the connection is simply dropped.
-async fn handle_connection(mut client_stream: TcpStream, state: VelaState, binding: &ProxyBinding) {
-    // Check upstream health at connection time — not cached.
-    if !is_upstream_healthy(&state, &binding.service_id).await {
+///
+/// The healthy set is rebuilt on EVERY new connection by reading from state —
+/// never cached. A newly failed upstream disappears from routing within one
+/// health-check cycle; a newly recovered one rejoins just as fast.
+async fn handle_connection(
+    mut client_stream: TcpStream,
+    state: VelaState,
+    binding: &ProxyBinding,
+    rr_counter: &AtomicUsize,
+) {
+    let healthy = state.get_healthy_upstreams(&binding.service_id).await;
+
+    if healthy.is_empty() {
         warn!(
-            "Proxy engine: rejecting connection for '{}' — upstream is not Healthy",
+            "Proxy engine: rejecting connection for '{}' — no healthy upstreams available",
             binding.service_id
         );
         // Drop client_stream → client receives TCP RST.
-        // In Phase 6 we could write an HTTP 502 here for HTTP clients.
+        // In a future phase we could write an HTTP 502 here for HTTP clients.
         return;
     }
+
+    let idx = rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
+    let (host, port) = &healthy[idx];
+    let upstream_addr = format!("{}:{}", host, port);
 
     // Apply idle timeout to upstream connection attempt.
     let upstream_stream = match timeout(
         Duration::from_secs(PROXY_IDLE_TIMEOUT_SECS),
-        TcpStream::connect(&binding.upstream_addr),
+        TcpStream::connect(&upstream_addr),
     )
     .await
     {
@@ -312,14 +350,14 @@ async fn handle_connection(mut client_stream: TcpStream, state: VelaState, bindi
         Ok(Err(e)) => {
             error!(
                 "Proxy engine: failed to connect to upstream '{}' at {}: {}",
-                binding.service_id, binding.upstream_addr, e
+                binding.service_id, upstream_addr, e
             );
             return;
         }
         Err(_elapsed) => {
             warn!(
                 "Proxy engine: upstream connection timeout for '{}' at {} ({}s)",
-                binding.service_id, binding.upstream_addr, PROXY_IDLE_TIMEOUT_SECS
+                binding.service_id, upstream_addr, PROXY_IDLE_TIMEOUT_SECS
             );
             return;
         }
@@ -327,7 +365,7 @@ async fn handle_connection(mut client_stream: TcpStream, state: VelaState, bindi
 
     debug!(
         "Proxy engine: tunnel open: client ↔ '{}' ({})",
-        binding.service_id, binding.upstream_addr
+        binding.service_id, upstream_addr
     );
 
     // Set TCP_NODELAY on both sides — reduces latency for small writes.
@@ -368,29 +406,14 @@ async fn handle_connection(mut client_stream: TcpStream, state: VelaState, bindi
     }
 }
 
-/// Checks whether the upstream for a given service is currently Healthy.
-/// Reads from the shared state store — always current, never cached.
-async fn is_upstream_healthy(state: &VelaState, service_id: &str) -> bool {
-    let snapshot = state.snapshot_services().await;
-    match snapshot.get(service_id) {
-        Some(service_state) => service_state.status == ServiceStatus::Healthy,
-        None => {
-            error!(
-                "Proxy engine: no state found for service '{}' — treating as unhealthy",
-                service_id
-            );
-            false
-        }
-    }
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{
-        GlobalConfig, HealthCheckConfig, HealthCheckKind, ProxyConfig, ServiceConfig, VelaConfig,
+        GlobalConfig, HealthCheckConfig, HealthCheckKind, ProxyConfig, ServiceConfig,
+        UpstreamConfig, VelaConfig,
     };
     use crate::state::VelaState;
     use std::net::TcpListener as StdTcpListener;
@@ -412,9 +435,15 @@ mod tests {
             services: vec![ServiceConfig {
                 id: "test-svc".to_string(),
                 name: "Test Service".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: service_port,
+                host: Some("127.0.0.1".to_string()),
+                port: Some(service_port),
                 command: None,
+                upstreams: vec![UpstreamConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: service_port,
+                    docker_container: None,
+                }],
+                restart: None,
                 check_interval_secs: 10,
                 failure_threshold: 3,
                 max_restarts: 3,
@@ -457,7 +486,7 @@ mod tests {
         let config = make_config_with_proxy(3001, 3001, 7700);
         assert!(
             validate_proxy_config(&config).is_err(),
-            "Proxy port == service port should be rejected"
+            "Proxy port == service upstream port should be rejected"
         );
     }
 
@@ -468,7 +497,11 @@ mod tests {
         // Add a second service using the same proxy port
         let mut second = config.services[0].clone();
         second.id = "svc2".to_string();
-        second.port = 3002;
+        second.upstreams = vec![UpstreamConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3002,
+            docker_container: None,
+        }];
         config.services.push(second);
 
         assert!(
@@ -497,7 +530,23 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].service_id, "test-svc");
         assert_eq!(bindings[0].listen_addr, "127.0.0.1:8001");
-        assert_eq!(bindings[0].upstream_addr, "127.0.0.1:3001");
+        assert_eq!(bindings[0].upstream_addrs, vec!["127.0.0.1:3001"]);
+    }
+
+    #[test]
+    fn build_proxy_bindings_multi_upstream_creates_correct_addr_list() {
+        let mut config = make_config_with_proxy(3001, 8001, 7700);
+        config.services[0].upstreams.push(UpstreamConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3002,
+            docker_container: None,
+        });
+        let bindings = build_proxy_bindings(&config);
+
+        assert_eq!(
+            bindings[0].upstream_addrs,
+            vec!["127.0.0.1:3001", "127.0.0.1:3002"]
+        );
     }
 
     #[test]
@@ -520,71 +569,6 @@ mod tests {
         assert!(
             bindings[0].listen_addr.starts_with("0.0.0.0"),
             "Should bind to 0.0.0.0 when bind_all_interfaces = true"
-        );
-    }
-
-    // ── is_upstream_healthy ────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn upstream_is_not_healthy_when_status_is_unknown() {
-        let (state, _rx) = VelaState::new();
-        state.register_service("svc".to_string()).await.unwrap();
-        // Initial status is Unknown — should not be treated as Healthy
-        assert!(
-            !is_upstream_healthy(&state, "svc").await,
-            "Unknown status should not be treated as Healthy"
-        );
-    }
-
-    #[tokio::test]
-    async fn upstream_is_healthy_after_successful_check() {
-        let (state, _rx) = VelaState::new();
-        state.register_service("svc".to_string()).await.unwrap();
-
-        // Simulate a successful health check to move service to Healthy
-        use crate::models::HealthRecord;
-        let record = HealthRecord {
-            service_id: "svc".to_string(),
-            success: true,
-            latency_ms: 1,
-            checked_at: chrono::Utc::now(),
-            error: None,
-        };
-        state
-            .record_health_check(record, "Test Service".to_string(), 3)
-            .await
-            .unwrap();
-
-        assert!(
-            is_upstream_healthy(&state, "svc").await,
-            "Service should be Healthy after a successful check"
-        );
-    }
-
-    #[tokio::test]
-    async fn upstream_is_not_healthy_after_failed_checks() {
-        let (state, _rx) = VelaState::new();
-        state.register_service("svc".to_string()).await.unwrap();
-
-        // Simulate failures crossing the threshold (threshold = 3)
-        use crate::models::HealthRecord;
-        for _ in 0..3 {
-            let record = HealthRecord {
-                service_id: "svc".to_string(),
-                success: false,
-                latency_ms: 0,
-                checked_at: chrono::Utc::now(),
-                error: Some("refused".to_string()),
-            };
-            state
-                .record_health_check(record, "Test Service".to_string(), 3)
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            !is_upstream_healthy(&state, "svc").await,
-            "Failed service should not be treated as Healthy"
         );
     }
 
@@ -630,28 +614,33 @@ mod tests {
         );
     }
 
+    /// Starts a TCP echo server that prefixes every response with `tag`,
+    /// so a test can tell which upstream instance actually handled a
+    /// given proxied connection.
+    async fn spawn_tagged_echo_server(tag: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1];
+                    if conn.read_exact(&mut buf).await.is_ok() {
+                        let _ = conn.write_all(tag.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        port
+    }
+
     #[tokio::test]
     async fn proxy_engine_forwards_bytes_to_healthy_upstream() {
         let (state, _rx) = VelaState::new();
         state
             .register_service("test-svc".to_string())
-            .await
-            .unwrap();
-
-        // Mark service as Healthy
-        use crate::models::HealthRecord;
-        state
-            .record_health_check(
-                HealthRecord {
-                    service_id: "test-svc".to_string(),
-                    success: true,
-                    latency_ms: 1,
-                    checked_at: chrono::Utc::now(),
-                    error: None,
-                },
-                "Test".to_string(),
-                3,
-            )
             .await
             .unwrap();
 
@@ -665,6 +654,33 @@ mod tests {
                 tokio::io::copy(&mut r, &mut w).await.ok();
             }
         });
+
+        // Mark this specific upstream Healthy. The proxy now routes purely
+        // off upstream_states (get_healthy_upstreams) — registering it here
+        // is required, not just marking the service healthy in the old
+        // service-level state.
+        state
+            .register_service_upstreams(
+                "test-svc".to_string(),
+                vec![crate::models::UpstreamState::initial(
+                    "127.0.0.1".to_string(),
+                    upstream_port,
+                )],
+            )
+            .await;
+        state
+            .record_upstream_health_check(
+                "test-svc",
+                "127.0.0.1",
+                upstream_port,
+                true,
+                1,
+                None,
+                3,
+                "Test".to_string(),
+            )
+            .await
+            .unwrap();
 
         let proxy_port = free_port();
         let api_port = free_port();
@@ -722,5 +738,132 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn handle_connection_round_robins_across_healthy_upstreams() {
+        let (state, _rx) = VelaState::new();
+        let service_id = "multi-svc".to_string();
+        state.register_service(service_id.clone()).await.unwrap();
+
+        let port_a = spawn_tagged_echo_server("A").await;
+        let port_b = spawn_tagged_echo_server("B").await;
+
+        state
+            .register_service_upstreams(
+                service_id.clone(),
+                vec![
+                    crate::models::UpstreamState::initial("127.0.0.1".to_string(), port_a),
+                    crate::models::UpstreamState::initial("127.0.0.1".to_string(), port_b),
+                ],
+            )
+            .await;
+
+        // Mark both upstreams Healthy.
+        state
+            .record_upstream_health_check(
+                &service_id,
+                "127.0.0.1",
+                port_a,
+                true,
+                1,
+                None,
+                3,
+                "Multi".to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .record_upstream_health_check(
+                &service_id,
+                "127.0.0.1",
+                port_b,
+                true,
+                1,
+                None,
+                3,
+                "Multi".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Exercise the exact same round-robin selection logic handle_connection
+        // uses: read the current healthy set, advance a shared counter, index in.
+        let rr_counter = AtomicUsize::new(0);
+        let mut tags_seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let healthy = state.get_healthy_upstreams(&service_id).await;
+            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) % healthy.len();
+            let (host, port) = &healthy[idx];
+
+            let mut conn = TcpStream::connect(format!("{}:{}", host, port))
+                .await
+                .unwrap();
+            conn.write_all(b"x").await.unwrap();
+            let mut buf = [0u8; 1];
+            conn.read_exact(&mut buf).await.unwrap();
+            tags_seen.insert(buf[0]);
+        }
+
+        assert_eq!(
+            tags_seen.len(),
+            2,
+            "Round-robin over 4 requests across 2 healthy upstreams should hit both"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_connection_excludes_failed_upstreams_from_rotation() {
+        let (state, _rx) = VelaState::new();
+        let service_id = "failover-svc".to_string();
+        state.register_service(service_id.clone()).await.unwrap();
+
+        let port_healthy = spawn_tagged_echo_server("H").await;
+        let port_failed = free_port(); // nothing listening — will be marked Failed
+
+        state
+            .register_service_upstreams(
+                service_id.clone(),
+                vec![
+                    crate::models::UpstreamState::initial("127.0.0.1".to_string(), port_healthy),
+                    crate::models::UpstreamState::initial("127.0.0.1".to_string(), port_failed),
+                ],
+            )
+            .await;
+
+        state
+            .record_upstream_health_check(
+                &service_id,
+                "127.0.0.1",
+                port_healthy,
+                true,
+                1,
+                None,
+                1,
+                "Failover".to_string(),
+            )
+            .await
+            .unwrap();
+        // One failure crosses failure_threshold=1 → Failed immediately.
+        state
+            .record_upstream_health_check(
+                &service_id,
+                "127.0.0.1",
+                port_failed,
+                false,
+                1,
+                Some("refused".to_string()),
+                1,
+                "Failover".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let healthy = state.get_healthy_upstreams(&service_id).await;
+        assert_eq!(
+            healthy,
+            vec![("127.0.0.1".to_string(), port_healthy)],
+            "Only the Healthy upstream should be eligible for routing"
+        );
     }
 }

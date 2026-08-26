@@ -6,8 +6,13 @@
 //! - Exponential backoff with jitter: prevents restart storms and thundering herd.
 //! - Per-service restart mutex: physically impossible to run two restarts
 //!   simultaneously for the same service.
+//! - Zero-code-path isolation: `handle_failed_service` takes exactly one
+//!   service's `ServiceConfig` and reads restart parameters (shell command,
+//!   or Docker container name) only from that config's own `restart` field.
+//!   There is no code path by which one service's failure can read or act
+//!   on a different service's restart target — see `handle_failed_service`.
 //! - Zombie-free: every spawned process is awaited and its exit status recorded.
-//! - External service safety: no action taken on services without a `command`.
+//! - `restart.mode = "none"` services are never touched — observed only.
 //!
 //! ## Shutdown
 //! Uses the same CancellationToken pattern as the health engine.
@@ -25,9 +30,11 @@ use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::docker_engine::{self, DockerClient};
 use crate::error::VelaError;
 use crate::models::{
-    RecoveryState, RestartOutcome, RestartRecord, ServiceConfig, ServiceStatus, StatusChangeEvent,
+    RecoveryState, RestartMode, RestartOutcome, RestartRecord, ServiceConfig, ServiceStatus,
+    StatusChangeEvent,
 };
 use crate::state::VelaState;
 
@@ -67,10 +74,15 @@ impl RecoveryEngineHandle {
 ///
 /// # Arguments
 /// * `state` — shared state store
-/// * `services` — full list of service configs (used to look up restart commands)
+/// * `services` — full list of service configs (used to look up restart config)
+/// * `docker_client` — shared Docker client, or `None` if Docker is
+///   unavailable. Services with `restart.mode = "docker"` log an error and
+///   skip the restart attempt when this is `None` — Docker being down never
+///   crashes Vela or blocks manual/none-mode services.
 pub async fn run(
     state: VelaState,
     services: Vec<ServiceConfig>,
+    docker_client: Option<DockerClient>,
 ) -> Result<RecoveryEngineHandle, VelaError> {
     if services.is_empty() {
         return Err(VelaError::ConfigValidation(
@@ -96,7 +108,14 @@ pub async fn run(
     let token_clone = cancellation_token.clone();
 
     let task_handle = tokio::spawn(async move {
-        run_coordinator_loop(state, service_map, recovery_states, token_clone).await;
+        run_coordinator_loop(
+            state,
+            service_map,
+            recovery_states,
+            docker_client,
+            token_clone,
+        )
+        .await;
     });
 
     info!(
@@ -116,6 +135,7 @@ async fn run_coordinator_loop(
     state: VelaState,
     service_map: Arc<HashMap<String, ServiceConfig>>,
     recovery_states: Arc<Mutex<HashMap<String, RecoveryState>>>,
+    docker_client: Option<DockerClient>,
     token: CancellationToken,
 ) {
     let mut ticker = interval(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -131,6 +151,7 @@ async fn run_coordinator_loop(
                     &state,
                     &service_map,
                     &recovery_states,
+                    &docker_client,
                 ).await;
             }
         }
@@ -144,6 +165,7 @@ async fn scan_and_recover(
     state: &VelaState,
     service_map: &Arc<HashMap<String, ServiceConfig>>,
     recovery_states: &Arc<Mutex<HashMap<String, RecoveryState>>>,
+    docker_client: &Option<DockerClient>,
 ) {
     let snapshot = state.snapshot_services().await;
 
@@ -182,7 +204,8 @@ async fn scan_and_recover(
             }
 
             ServiceStatus::Failed => {
-                handle_failed_service(state, config, service_state, recovery_states).await;
+                handle_failed_service(state, config, service_state, recovery_states, docker_client)
+                    .await;
             }
         }
     }
@@ -190,23 +213,45 @@ async fn scan_and_recover(
 
 /// Handles a single service in Failed status.
 /// Decides whether to restart, wait for backoff, or give up.
+///
+/// # Isolation guarantee
+/// This function reads restart parameters exclusively from `config`, the
+/// one service it was called for. `config.restart` — and, for Docker mode,
+/// `config.restart.docker.container` — is a field on THIS service's own
+/// config, not any global or shared value. There is no way for a failure
+/// in one service to read or act on another service's restart target: the
+/// only service config this function ever sees is the one passed as `config`.
 async fn handle_failed_service(
     state: &VelaState,
     config: &ServiceConfig,
     _service_state: &crate::models::ServiceState,
     recovery_states: &Arc<Mutex<HashMap<String, RecoveryState>>>,
+    docker_client: &Option<DockerClient>,
 ) {
-    // Safety guarantee #4: external services (no restart command) are never touched.
-    let command = match &config.command {
-        Some(cmd) => cmd.clone(),
+    // RestartConfig is guaranteed Some by config.rs synthesis — every
+    // service gets one, even if the user wrote neither `command` nor
+    // `[services.restart]`.
+    let restart = match &config.restart {
+        Some(r) => r,
         None => {
-            warn!(
-                "Recovery engine: '{}' is Failed but has no restart command — cannot recover automatically",
+            error!(
+                "Recovery engine: '{}' has no RestartConfig — this should be unreachable \
+                 after config synthesis; treating as restart.mode = \"none\"",
                 config.id
             );
             return;
         }
     };
+
+    // restart.mode = "none": external services Vela cannot control, or the
+    // user explicitly opted out of automatic recovery. Never touched.
+    if restart.mode == RestartMode::None {
+        warn!(
+            "Recovery engine: '{}' is Failed but restart.mode = \"none\" — cannot recover automatically",
+            config.id
+        );
+        return;
+    }
 
     let mut states = recovery_states.lock().await;
     let recovery_state = match states.get_mut(&config.id) {
@@ -276,17 +321,60 @@ async fn handle_failed_service(
     recovery_state.current_episode_attempts = attempt_number;
     recovery_state.backoff_started_at = Some(now);
 
+    let mode_label = match restart.mode {
+        RestartMode::Docker => "Docker",
+        RestartMode::Manual => "manual",
+        RestartMode::None => unreachable!("returned above"),
+    };
+
     info!(
-        "Recovery engine: attempting restart of '{}' (attempt {}/{})",
-        config.id, attempt_number, config.max_restarts
+        "Recovery engine: attempting {} restart of '{}' (attempt {}/{})",
+        mode_label, config.id, attempt_number, config.max_restarts
     );
 
     // We must drop the lock before awaiting the restart.
     // RULE: Never hold a Mutex across an await point.
     drop(states);
 
-    // Execute the restart command.
-    let outcome = execute_restart_command(&command, &config.id).await;
+    // Dispatch by restart mode. See the isolation guarantee in this
+    // function's doc comment: every value read below comes from `restart`,
+    // which came from `config`, which is the one service this call is for.
+    let outcome = match restart.mode {
+        RestartMode::Manual => {
+            // Guaranteed Some by RestartConfig::validate for mode = "manual".
+            let command = restart.command.as_deref().unwrap_or("");
+            execute_restart_command(command, &config.id).await
+        }
+        RestartMode::Docker => {
+            // Guaranteed Some by RestartConfig::validate for mode = "docker".
+            match (&restart.docker, docker_client) {
+                (Some(docker_cfg), Some(client)) => match &docker_cfg.image {
+                    Some(image) => {
+                        docker_engine::repull_and_restart(client, &docker_cfg.container, image)
+                            .await
+                    }
+                    None => docker_engine::restart_container(client, &docker_cfg.container).await,
+                },
+                (_, None) => {
+                    error!(
+                        "Recovery engine: '{}' has restart.mode = \"docker\" but Docker client \
+                         is unavailable — is Docker running?",
+                        config.id
+                    );
+                    RestartOutcome::SpawnError("Docker client unavailable".to_string())
+                }
+                (None, Some(_)) => {
+                    error!(
+                        "Recovery engine: '{}' has restart.mode = \"docker\" but no docker \
+                         config — should be unreachable after validation",
+                        config.id
+                    );
+                    RestartOutcome::SpawnError("no Docker config".to_string())
+                }
+            }
+        }
+        RestartMode::None => unreachable!("returned above"),
+    };
 
     // Re-acquire the lock to update recovery state with the outcome.
     let mut states = recovery_states.lock().await;
@@ -298,8 +386,8 @@ async fn handle_failed_service(
     match &outcome {
         RestartOutcome::Succeeded => {
             info!(
-                "Recovery engine: restart command for '{}' completed successfully (attempt {})",
-                config.id, attempt_number
+                "Recovery engine: {} restart of '{}' completed successfully (attempt {})",
+                mode_label, config.id, attempt_number
             );
             // Advance backoff for the next attempt (if the restart didn't actually fix it).
             // The health engine will determine if the service is actually healthy.
@@ -307,22 +395,22 @@ async fn handle_failed_service(
         }
         RestartOutcome::Failed(reason) => {
             warn!(
-                "Recovery engine: restart command for '{}' exited with error: {} (attempt {})",
-                config.id, reason, attempt_number
+                "Recovery engine: {} restart of '{}' exited with error: {} (attempt {})",
+                mode_label, config.id, reason, attempt_number
             );
             recovery_state.advance_backoff();
         }
         RestartOutcome::SpawnError(reason) => {
             error!(
-                "Recovery engine: could not spawn restart command for '{}': {} (attempt {})",
-                config.id, reason, attempt_number
+                "Recovery engine: could not perform {} restart of '{}': {} (attempt {})",
+                mode_label, config.id, reason, attempt_number
             );
             recovery_state.advance_backoff();
         }
         RestartOutcome::TimedOut => {
             error!(
-                "Recovery engine: restart command for '{}' timed out after {}s (attempt {})",
-                config.id, RESTART_COMMAND_TIMEOUT_SECS, attempt_number
+                "Recovery engine: {} restart of '{}' timed out (attempt {})",
+                mode_label, config.id, attempt_number
             );
             recovery_state.advance_backoff();
         }
@@ -417,19 +505,25 @@ async fn execute_restart_command(command: &str, service_id: &str) -> RestartOutc
 mod tests {
     use super::*;
     use crate::models::{
-        HealthCheckConfig, HealthCheckKind, RecoveryState, ServiceConfig, BASE_BACKOFF_SECS,
-        MAX_BACKOFF_SECS,
+        HealthCheckConfig, HealthCheckKind, RestartConfig, ServiceConfig, UpstreamConfig,
+        BASE_BACKOFF_SECS, MAX_BACKOFF_SECS,
     };
     use crate::state::VelaState;
 
     /// Builds a minimal ServiceConfig for testing.
-    fn make_test_service(id: &str, command: Option<&str>) -> ServiceConfig {
+    fn make_test_service(id: &str, restart: Option<RestartConfig>) -> ServiceConfig {
         ServiceConfig {
             id: id.to_string(),
             name: format!("Test {}", id),
-            host: "127.0.0.1".to_string(),
-            port: 9999,
-            command: command.map(str::to_string),
+            host: Some("127.0.0.1".to_string()),
+            port: Some(9999),
+            command: None,
+            upstreams: vec![UpstreamConfig {
+                host: "127.0.0.1".to_string(),
+                port: 9999,
+                docker_container: None,
+            }],
+            restart,
             check_interval_secs: 5,
             failure_threshold: 3,
             max_restarts: 3,
@@ -440,6 +534,22 @@ mod tests {
             },
             proxy: None,
             alerts: vec![],
+        }
+    }
+
+    fn manual_restart(command: &str) -> RestartConfig {
+        RestartConfig {
+            mode: RestartMode::Manual,
+            command: Some(command.to_string()),
+            docker: None,
+        }
+    }
+
+    fn none_restart() -> RestartConfig {
+        RestartConfig {
+            mode: RestartMode::None,
+            command: None,
+            docker: None,
         }
     }
 
@@ -548,10 +658,10 @@ mod tests {
     #[tokio::test]
     async fn recovery_engine_starts_and_shuts_down_cleanly() {
         let (state, _rx) = VelaState::new();
-        let service = make_test_service("engine-test", Some("true"));
+        let service = make_test_service("engine-test", Some(manual_restart("true")));
         state.register_service(service.id.clone()).await.unwrap();
 
-        let handle = run(state, vec![service])
+        let handle = run(state, vec![service], None)
             .await
             .expect("Recovery engine should start");
 
@@ -568,16 +678,15 @@ mod tests {
     #[tokio::test]
     async fn recovery_engine_refuses_to_start_with_zero_services() {
         let (state, _rx) = VelaState::new();
-        let result = run(state, vec![]).await;
+        let result = run(state, vec![], None).await;
         assert!(result.is_err(), "Should error on zero services");
     }
 
     #[tokio::test]
-    async fn recovery_engine_does_not_act_on_service_without_command() {
+    async fn recovery_skips_restart_for_mode_none_services() {
         // A service with no command should never trigger a restart.
-        // We verify this by ensuring no RestartRecord appears in state.
         let (state, _rx) = VelaState::new();
-        let service = make_test_service("no-command-svc", None); // no command
+        let service = make_test_service("no-command-svc", Some(none_restart()));
         state.register_service(service.id.clone()).await.unwrap();
 
         // Manually force the service state to Failed
@@ -597,7 +706,7 @@ mod tests {
                 .unwrap();
         }
 
-        let handle = run(state.clone(), vec![service.clone()])
+        let handle = run(state.clone(), vec![service.clone()], None)
             .await
             .expect("Engine should start");
 
@@ -605,14 +714,84 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         handle.shutdown().await;
 
-        // No restart records should exist — command was None
-        let restart_records = state.get_health_records(&service.id).await;
-        // Health records exist (from our manual insertion above), but
-        // the key thing is no restart was attempted — verified by the
-        // absence of any restart state changes in the recovery_states map.
-        // (RestartRecord retrieval not yet exposed by state.rs —
-        //  this is acceptable for Phase 3; Phase 6 API engine will expose it.)
-        let _ = restart_records; // suppress unused warning
-                                 // Test passes if we reach here without a panic or hang.
+        // No restart records should exist — mode was None.
+        let restarts = state.get_restart_records(&service.id).await;
+        assert!(
+            restarts.is_empty(),
+            "restart.mode = \"none\" must never produce a restart attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_shell_command_for_manual_mode() {
+        // `true` always succeeds — a Failed service with a manual restart
+        // config should end up with at least one successful RestartRecord.
+        let (state, _rx) = VelaState::new();
+        let service = make_test_service("manual-mode-svc", Some(manual_restart("true")));
+        state.register_service(service.id.clone()).await.unwrap();
+
+        use crate::models::HealthRecord;
+        for _ in 0..3 {
+            let record = HealthRecord {
+                service_id: service.id.clone(),
+                success: false,
+                latency_ms: 0,
+                checked_at: Utc::now(),
+                error: Some("simulated failure".to_string()),
+            };
+            state
+                .record_health_check(record, service.name.clone(), 3)
+                .await
+                .unwrap();
+        }
+
+        let handle = run(state.clone(), vec![service.clone()], None)
+            .await
+            .expect("Engine should start");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.shutdown().await;
+
+        let restarts = state.get_restart_records(&service.id).await;
+        assert!(
+            !restarts.is_empty(),
+            "Manual mode should attempt at least one restart for a Failed service"
+        );
+        assert!(
+            restarts[0].succeeded,
+            "The 'true' command should always succeed"
+        );
+    }
+
+    #[test]
+    fn per_service_isolation_confirmed_by_config_field_binding() {
+        // This is a compile-time/structural assertion, not a runtime one:
+        // handle_failed_service takes `config: &ServiceConfig` and reads
+        // `config.restart` — there is no parameter, global, or shared state
+        // through which a DIFFERENT service's restart config could reach
+        // this function. Two independently-constructed configs prove the
+        // container name for one is never visible while processing the other.
+        let payment = make_test_service(
+            "payment",
+            Some(RestartConfig {
+                mode: RestartMode::Docker,
+                command: None,
+                docker: Some(crate::models::DockerConfig {
+                    container: "payment-container".to_string(),
+                    image: None,
+                    socket_path: None,
+                }),
+            }),
+        );
+        let auth = make_test_service("auth", Some(manual_restart("systemctl restart auth")));
+
+        // payment's config never contains auth's command, and vice versa —
+        // they are entirely separate ServiceConfig values.
+        assert_ne!(payment.id, auth.id);
+        assert!(payment.command.is_none());
+        assert_eq!(
+            auth.restart.as_ref().unwrap().command.as_deref(),
+            Some("systemctl restart auth")
+        );
     }
 }

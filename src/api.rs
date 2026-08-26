@@ -470,9 +470,11 @@ mod tests {
         ServiceConfig {
             id: id.to_string(),
             name: format!("Test Service {}", id),
-            host: "127.0.0.1".to_string(),
-            port: 9999,
+            host: Some("127.0.0.1".to_string()),
+            port: Some(9999),
             command: None,
+            upstreams: vec![],
+            restart: None,
             check_interval_secs: 10,
             failure_threshold: 3,
             max_restarts: 3,

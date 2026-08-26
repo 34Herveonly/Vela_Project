@@ -1,9 +1,19 @@
-//! Health engine — monitors all configured services concurrently.
+//! Health engine — monitors every upstream of every configured service.
 //!
 //! ## Design
-//! Each service gets an independent tokio task running on its own interval.
-//! Tasks run concurrently via tokio's cooperative scheduler — not sequentially.
-//! This ensures that a slow or timing-out service never blocks checks on others.
+//! One independent tokio task per UPSTREAM (not per service). A service
+//! with two upstreams gets two independent check loops. This ensures a
+//! slow or timing-out upstream never blocks checks on any other upstream —
+//! including a sibling upstream of the same service.
+//!
+//! ## Docker-aware checks
+//! When an upstream's `docker_container` is set and a Docker client is
+//! available, the container's running state is checked first — a stopped
+//! container is an immediate failure regardless of what TCP/HTTP would say.
+//! If the container is running, the existing TCP/HTTP check still runs as
+//! confirmation that the service inside it is actually responding. If no
+//! Docker client is available, Vela falls back to TCP/HTTP only and logs
+//! a warning — Docker is optional, never required.
 //!
 //! ## Shutdown
 //! All tasks hold a clone of a CancellationToken. Calling shutdown() on the
@@ -11,7 +21,7 @@
 //! on its next iteration. No task is forcefully killed — they drain gracefully.
 //!
 //! ## Scale
-//! Designed and tested for up to 1,000 concurrent service checks.
+//! Designed and tested for up to 1,000 concurrent upstream checks.
 //! Each task is a lightweight tokio green thread — not an OS thread.
 
 use std::time::{Duration, Instant};
@@ -21,14 +31,17 @@ use tokio::time::{interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::docker_engine::{self, DockerClient};
 use crate::error::VelaError;
-use crate::models::{CheckResult, HealthCheckKind, HealthRecord, ServiceConfig};
+use crate::models::{
+    CheckResult, HealthCheckConfig, HealthCheckKind, ServiceConfig, UpstreamConfig,
+};
 use crate::state::VelaState;
 
 /// Handle returned by `run()`. Gives the caller clean control over the engine.
 /// Call `shutdown()` to stop all health check tasks gracefully.
 pub struct HealthEngineHandle {
-    /// One JoinHandle per monitored service.
+    /// One JoinHandle per monitored upstream.
     task_handles: Vec<JoinHandle<()>>,
     /// Shared cancellation token. Cancelling this stops all tasks.
     cancellation_token: CancellationToken,
@@ -53,18 +66,23 @@ impl HealthEngineHandle {
     }
 }
 
-/// Starts the health engine. Spawns one async task per configured service.
-/// Returns a HealthEngineHandle for lifecycle management.
+/// Starts the health engine. Spawns one async task per upstream across all
+/// configured services. Returns a HealthEngineHandle for lifecycle management.
 ///
 /// # Arguments
 /// * `state` — shared state store, cloned per task
-/// * `services` — list of service configs to monitor
+/// * `services` — list of service configs to monitor (each with >=1 upstream
+///   after config.rs synthesis)
+/// * `docker_client` — shared Docker client, or `None` if Docker is
+///   unavailable. Docker-mode upstreams fall back to TCP/HTTP-only checks
+///   when this is `None` — see the module doc comment.
 ///
 /// # Errors
 /// Returns VelaError if no services are provided (programmer error).
 pub async fn run(
     state: VelaState,
     services: Vec<ServiceConfig>,
+    docker_client: Option<DockerClient>,
 ) -> Result<HealthEngineHandle, VelaError> {
     if services.is_empty() {
         return Err(VelaError::ConfigValidation(
@@ -73,27 +91,55 @@ pub async fn run(
     }
 
     let cancellation_token = CancellationToken::new();
-    let mut task_handles = Vec::with_capacity(services.len());
+    let mut task_handles = Vec::new();
 
     for service in services {
-        let state_clone = state.clone();
-        let token_clone = cancellation_token.clone();
-        let service_name = service.name.clone();
+        let failure_threshold = service.failure_threshold;
+        let check_interval_secs = service.check_interval_secs;
 
-        info!(
-            "Health engine: starting check loop for '{}' ({}:{}) every {}s",
-            service.id, service.host, service.port, service.check_interval_secs
-        );
+        for upstream in &service.upstreams {
+            let state_clone = state.clone();
+            let token_clone = cancellation_token.clone();
+            let service_id = service.id.clone();
+            let service_name = service.name.clone();
+            let upstream_clone = upstream.clone();
+            let health_check = service.health_check.clone();
+            let docker_client_clone = docker_client.clone();
 
-        let handle = tokio::spawn(async move {
-            run_check_loop(state_clone, service, service_name, token_clone).await;
-        });
+            info!(
+                "Health engine: starting check loop for '{}' upstream {}:{} every {}s{}",
+                service_id,
+                upstream.host,
+                upstream.port,
+                check_interval_secs,
+                upstream
+                    .docker_container
+                    .as_ref()
+                    .map(|c| format!(" (docker container '{}')", c))
+                    .unwrap_or_default()
+            );
 
-        task_handles.push(handle);
+            let handle = tokio::spawn(async move {
+                run_check_loop(
+                    state_clone,
+                    service_id,
+                    service_name,
+                    upstream_clone,
+                    health_check,
+                    check_interval_secs,
+                    failure_threshold,
+                    docker_client_clone,
+                    token_clone,
+                )
+                .await;
+            });
+
+            task_handles.push(handle);
+        }
     }
 
     info!(
-        "Health engine: monitoring {} service(s) concurrently",
+        "Health engine: monitoring {} upstream(s) concurrently",
         task_handles.len()
     );
 
@@ -103,16 +149,23 @@ pub async fn run(
     })
 }
 
-/// The check loop for a single service. Runs until the cancellation token fires.
+/// The check loop for a single upstream. Runs until the cancellation token fires.
 /// This function never returns an error — all errors are recorded in state.
-/// A panic inside this function would only kill one service's check loop, not the engine.
+/// A panic inside this function would only kill one upstream's check loop,
+/// not the engine, and not any sibling upstream of the same service.
+#[allow(clippy::too_many_arguments)]
 async fn run_check_loop(
     state: VelaState,
-    service: ServiceConfig,
+    service_id: String,
     service_name: String,
+    upstream: UpstreamConfig,
+    health_check: HealthCheckConfig,
+    check_interval_secs: u64,
+    failure_threshold: u32,
+    docker_client: Option<DockerClient>,
     token: CancellationToken,
 ) {
-    let check_interval = Duration::from_secs(service.check_interval_secs);
+    let check_interval = Duration::from_secs(check_interval_secs);
     let mut ticker = interval(check_interval);
 
     // Tick immediately fires on first call — this gives us an instant first check
@@ -121,37 +174,90 @@ async fn run_check_loop(
         tokio::select! {
             // Cancellation takes priority over the interval tick
             _ = token.cancelled() => {
-                debug!("Health engine: check loop for '{}' received shutdown signal", service.id);
+                debug!(
+                    "Health engine: check loop for '{}' upstream {}:{} received shutdown signal",
+                    service_id, upstream.host, upstream.port
+                );
                 return;
             }
             _ = ticker.tick() => {
-                let result = execute_check(&service).await;
-                record_result(&state, result, &service, &service_name).await;
+                let result = execute_check(&upstream, &health_check, &service_id, &docker_client).await;
+                record_result(&state, result, &upstream, &service_name, failure_threshold).await;
             }
         }
     }
 }
 
-/// Executes a single health check against a service.
+/// Executes a single health check against one upstream.
 /// Returns a CheckResult regardless of success or failure — never panics.
 ///
-/// Timing: measures wall-clock latency from start of check to completion.
-/// This includes DNS resolution and TCP handshake for accurate real-world latency.
-async fn execute_check(service: &ServiceConfig) -> CheckResult {
+/// For Docker-backed upstreams: the container's running state is checked
+/// first. A stopped container fails immediately, without even attempting
+/// the TCP/HTTP check. A running container still must pass the TCP/HTTP
+/// check — "the container exists" is not the same claim as "the service
+/// inside it is responding."
+async fn execute_check(
+    upstream: &UpstreamConfig,
+    health_check: &HealthCheckConfig,
+    service_id: &str,
+    docker_client: &Option<DockerClient>,
+) -> CheckResult {
     let start = Instant::now();
-    let timeout_duration = Duration::from_millis(service.health_check.timeout_ms);
-    let addr = format!("{}:{}", service.host, service.port);
+    let timeout_duration = Duration::from_millis(health_check.timeout_ms);
+    let addr = format!("{}:{}", upstream.host, upstream.port);
 
-    let outcome = match service.health_check.kind {
+    if let Some(container) = &upstream.docker_container {
+        match docker_client {
+            Some(client) => match docker_engine::get_container_status(client, container).await {
+                Ok(false) => {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    let reason = format!("Docker container '{}' is not running", container);
+                    warn!(
+                        "Health check FAILED: service='{}' upstream={} latency={}ms error={}",
+                        service_id, addr, latency_ms, reason
+                    );
+                    return CheckResult {
+                        service_id: service_id.to_string(),
+                        success: false,
+                        latency_ms,
+                        error: Some(reason),
+                    };
+                }
+                Err(e) => {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    let reason = format!("Docker status check failed for '{}': {}", container, e);
+                    warn!(
+                        "Health check FAILED: service='{}' upstream={} latency={}ms error={}",
+                        service_id, addr, latency_ms, reason
+                    );
+                    return CheckResult {
+                        service_id: service_id.to_string(),
+                        success: false,
+                        latency_ms,
+                        error: Some(reason),
+                    };
+                }
+                Ok(true) => {
+                    // Container is running — fall through to the TCP/HTTP
+                    // check below as secondary confirmation.
+                }
+            },
+            None => {
+                warn!(
+                    "Health engine: upstream {} for '{}' has docker_container set but Docker \
+                     is unavailable — falling back to TCP/HTTP only",
+                    addr, service_id
+                );
+            }
+        }
+    }
+
+    let outcome = match health_check.kind {
         HealthCheckKind::Tcp => check_tcp(&addr, timeout_duration).await,
         HealthCheckKind::Http => {
-            let path = service
-                .health_check
-                .http_path
-                .as_deref()
-                .unwrap_or("/health");
-            let url = format!("http://{}:{}{}", service.host, service.port, path);
-            check_http(&url, timeout_duration, service.health_check.timeout_ms).await
+            let path = health_check.http_path.as_deref().unwrap_or("/health");
+            let url = format!("http://{}:{}{}", upstream.host, upstream.port, path);
+            check_http(&url, timeout_duration, health_check.timeout_ms).await
         }
     };
 
@@ -160,11 +266,11 @@ async fn execute_check(service: &ServiceConfig) -> CheckResult {
     match outcome {
         Ok(()) => {
             debug!(
-                "Health check OK: service='{}' latency={}ms",
-                service.id, latency_ms
+                "Health check OK: service='{}' upstream={} latency={}ms",
+                service_id, addr, latency_ms
             );
             CheckResult {
-                service_id: service.id.clone(),
+                service_id: service_id.to_string(),
                 success: true,
                 latency_ms,
                 error: None,
@@ -172,11 +278,11 @@ async fn execute_check(service: &ServiceConfig) -> CheckResult {
         }
         Err(e) => {
             warn!(
-                "Health check FAILED: service='{}' latency={}ms error={}",
-                service.id, latency_ms, e
+                "Health check FAILED: service='{}' upstream={} latency={}ms error={}",
+                service_id, addr, latency_ms, e
             );
             CheckResult {
-                service_id: service.id.clone(),
+                service_id: service_id.to_string(),
                 success: false,
                 latency_ms,
                 error: Some(e.to_string()),
@@ -246,31 +352,33 @@ async fn check_http(
     }
 }
 
-/// Converts a CheckResult into a HealthRecord and writes it to the state store.
-/// Logs at appropriate levels — info for first-time recovery, debug for routine checks.
+/// Records one upstream's check outcome in the shared state store.
+/// Logs at ERROR (not the usual WARN/DEBUG) because a failure here means
+/// the state store itself is broken — a much more serious condition than
+/// the upstream simply being down.
 async fn record_result(
     state: &VelaState,
     result: CheckResult,
-    service: &ServiceConfig,
+    upstream: &UpstreamConfig,
     service_name: &str,
+    failure_threshold: u32,
 ) {
-    let record = HealthRecord {
-        service_id: result.service_id.clone(),
-        success: result.success,
-        latency_ms: result.latency_ms,
-        checked_at: chrono::Utc::now(),
-        error: result.error,
-    };
-
     if let Err(e) = state
-        .record_health_check(record, service_name.to_string(), service.failure_threshold)
+        .record_upstream_health_check(
+            &result.service_id,
+            &upstream.host,
+            upstream.port,
+            result.success,
+            result.latency_ms,
+            result.error,
+            failure_threshold,
+            service_name.to_string(),
+        )
         .await
     {
-        // This should never happen in normal operation.
-        // If it does, it means the state store is corrupted — log loudly.
         error!(
-            "CRITICAL: Health engine failed to write check result for '{}': {}",
-            result.service_id, e
+            "CRITICAL: Health engine failed to write check result for '{}' upstream {}:{}: {}",
+            result.service_id, upstream.host, upstream.port, e
         );
     }
 }
@@ -288,9 +396,15 @@ mod tests {
         ServiceConfig {
             id: id.to_string(),
             name: format!("Test Service {}", id),
-            host: "127.0.0.1".to_string(),
-            port,
+            host: Some("127.0.0.1".to_string()),
+            port: Some(port),
             command: None,
+            upstreams: vec![UpstreamConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                docker_container: None,
+            }],
+            restart: None,
             check_interval_secs: 5,
             failure_threshold: 3,
             max_restarts: 3,
@@ -340,7 +454,8 @@ mod tests {
     async fn execute_check_returns_success_for_open_port() {
         let (_listener, port) = bind_ephemeral_port();
         let service = make_test_service("test-svc", port, HealthCheckKind::Tcp);
-        let result = execute_check(&service).await;
+        let upstream = &service.upstreams[0];
+        let result = execute_check(upstream, &service.health_check, &service.id, &None).await;
         assert!(
             result.success,
             "execute_check should succeed for open TCP port"
@@ -358,9 +473,25 @@ mod tests {
         let (listener, port) = bind_ephemeral_port();
         drop(listener); // Close it immediately
         let service = make_test_service("dead-svc", port, HealthCheckKind::Tcp);
-        let result = execute_check(&service).await;
+        let upstream = &service.upstreams[0];
+        let result = execute_check(upstream, &service.health_check, &service.id, &None).await;
         assert!(!result.success, "execute_check should fail for closed port");
         assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_check_falls_back_to_tcp_when_docker_container_set_but_no_client() {
+        // docker_container is set but docker_client is None — must not panic,
+        // must fall back to the TCP check and still succeed for an open port.
+        let (_listener, port) = bind_ephemeral_port();
+        let mut service = make_test_service("docker-fallback", port, HealthCheckKind::Tcp);
+        service.upstreams[0].docker_container = Some("some-container".to_string());
+        let upstream = &service.upstreams[0];
+        let result = execute_check(upstream, &service.health_check, &service.id, &None).await;
+        assert!(
+            result.success,
+            "Should fall back to TCP check and succeed when Docker is unavailable"
+        );
     }
 
     #[tokio::test]
@@ -373,8 +504,18 @@ mod tests {
             .register_service(service.id.clone())
             .await
             .expect("Failed to register service");
+        state
+            .register_service_upstreams(
+                service.id.clone(),
+                service
+                    .upstreams
+                    .iter()
+                    .map(|u| crate::models::UpstreamState::initial(u.host.clone(), u.port))
+                    .collect(),
+            )
+            .await;
 
-        let handle = run(state.clone(), vec![service])
+        let handle = run(state.clone(), vec![service], None)
             .await
             .expect("Health engine should start successfully");
 
@@ -401,8 +542,18 @@ mod tests {
             .register_service(service_id.clone())
             .await
             .expect("Failed to register service");
+        state
+            .register_service_upstreams(
+                service_id.clone(),
+                service
+                    .upstreams
+                    .iter()
+                    .map(|u| crate::models::UpstreamState::initial(u.host.clone(), u.port))
+                    .collect(),
+            )
+            .await;
 
-        let handle = run(state.clone(), vec![service])
+        let handle = run(state.clone(), vec![service], None)
             .await
             .expect("Health engine should start");
 
@@ -425,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn health_engine_refuses_to_start_with_zero_services() {
         let (state, _rx) = VelaState::new();
-        let result = run(state, vec![]).await;
+        let result = run(state, vec![], None).await;
         assert!(
             result.is_err(),
             "Health engine should return error when started with no services"
