@@ -33,7 +33,9 @@ API port) are included for operating a running instance.
 
 ## Quick start (native Rust)
 
-**Prerequisites:** Rust 1.78+ installed via [rustup](https://rustup.rs)
+**Prerequisites:** Rust 1.85+ installed via [rustup](https://rustup.rs)
+(a transitive dependency requires edition-2024 support; see the `Dockerfile`
+builder stage for the pinned toolchain used in CI/image builds)
 
 ```bash
 # Clone the repository
@@ -244,14 +246,63 @@ curl -H "Authorization: Bearer your-api-key" \
   http://localhost:7700/api/v1/services/auth-service/checks
 ```
 
+## Operating a running instance
+
+Vela ships two ways to look at a running instance without scripting `curl`
+yourself: a CLI (`vela-ctl`) and an embedded web dashboard. Both are
+read-only clients of the REST API above — neither one carries any state
+of its own.
+
+### CLI (`vela-ctl`)
+
+Built alongside the main binary (`cargo build --release` produces both
+`target/release/vela` and `target/release/vela-ctl`).
+
+```bash
+# Point it at your instance — via flags or environment variables
+export VELA_URL="http://localhost:7700"        # default: http://127.0.0.1:7700
+export VELA_API_KEY="your-api-key"
+
+# Aggregated status of every service (also the default for `services` with no ID)
+vela-ctl status
+
+# Detail for one service
+vela-ctl services auth-service
+
+# Recent history for one service — checks | alerts | restarts
+vela-ctl services auth-service checks
+vela-ctl services auth-service alerts
+vela-ctl services auth-service restarts
+
+# --url and --key flags override the environment variables
+vela-ctl --url http://prod-host:7700 --key "prod-key" status
+```
+
+Output is colorized and column-aligned in a terminal (`●` healthy,
+`◐` degraded, `✗` failed, `○` unknown); a missing `VELA_API_KEY`/`--key`
+fails fast with a message showing how to set it.
+
+### Web dashboard
+
+Every Vela instance serves a single-page dashboard at the API root —
+unauthenticated to load (`GET /` on `api_port`), but every data request
+it makes is a normal authenticated call to the `/api/v1/*` endpoints
+above. On first visit it prompts once for your API key and keeps it only
+in the browser's `sessionStorage` (cleared when the tab closes) — Vela
+itself never stores it.
+
+```
+http://localhost:7700/
+```
+
+It shows the same aggregated status, per-service detail, and recent
+checks/alerts/restarts history as `vela-ctl` and the API, in a browser.
+
 ## Running tests
 
 ```bash
-# Unit tests
+# Full test suite — unit tests across all modules
 cargo test
-
-# Integration tests (requires Docker for mock services)
-cargo test --test full_stack
 
 # Watch mode during development
 cargo watch -x test
