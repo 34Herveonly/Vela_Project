@@ -1,6 +1,7 @@
 /target
 Cargo.lock
 config.toml
+config.test.toml
 *.log
 .env
 .DS_Store
