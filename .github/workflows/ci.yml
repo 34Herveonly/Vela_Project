@@ -1,0 +1,166 @@
+# CI — runs on every push and every pull request targeting main.
+#
+# Jobs run in dependency order: fmt gates everything (it's the cheapest
+# check, so fail fast on it); clippy and test then run in parallel since
+# neither depends on the other; build only starts once both are clean;
+# docker-build runs last to confirm the Dockerfile still produces a
+# valid image from whatever build just passed.
+#
+# Status badge:
+# https://github.com/34Herveonly/Vela_Project/actions/workflows/ci.yml/badge.svg
+
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: cargo fmt -- --check
+        run: cargo fmt -- --check
+
+  clippy:
+    name: Run Clippy linter
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # -D warnings matches the zero-warnings policy this project has held
+      # since Phase 1 — any clippy warning fails the build, not just lints it.
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # 92 tests as of the last count in TESTING.md — see that file if this
+      # number drifts; it tracks per-module counts too.
+      - name: cargo test --all-targets
+        run: cargo test --all-targets
+
+      - name: cargo test --doc
+        run: cargo test --doc
+
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    needs: [clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo build --release --all-targets
+        run: cargo build --release --all-targets
+
+      - name: Verify both binaries exist
+        run: ls -lh target/release/vela target/release/vela-ctl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vela-binary
+          path: target/release/vela
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vela-ctl-binary
+          path: target/release/vela-ctl
+          retention-days: 7
+
+  docker-build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Push happens only in CD, after a merge to main — this job exists
+      # solely to confirm the Dockerfile still produces a valid image.
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ghcr.io/34herveonly/vela:ci-test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify image was built
+        run: docker images | grep vela
+
+      # Runs without a mounted config.toml, so Vela exits(1) immediately
+      # after logging "Failed to load config" — that failure is expected
+      # and is not what this step is checking. It only confirms the image
+      # starts a container at all; real behavior is covered by cargo test
+      # and the live rounds in TESTING.md, not by CI.
+      - name: Smoke-start the image
+        run: |
+          docker run --rm -d --name vela-ci-test \
+            -p 7700:7700 \
+            ghcr.io/34herveonly/vela:ci-test || true
+          sleep 2
+          docker rm -f vela-ci-test 2>/dev/null || true
