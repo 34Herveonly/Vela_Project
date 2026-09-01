@@ -105,7 +105,7 @@ pub async fn run(
 
     let app = build_router(app_state);
 
-    let bind_addr = format!("127.0.0.1:{}", api_port);
+    let bind_addr = format!("0.0.0.0:{}", api_port);
     let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
         VelaError::ApiError(format!("Failed to bind API server on {}: {}", bind_addr, e))
     })?;
