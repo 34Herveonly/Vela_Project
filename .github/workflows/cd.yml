@@ -46,6 +46,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Required for cache-to/cache-from: type=gha below — the default
+      # "docker" driver can't export cache at all, only the "docker-container"
+      # driver this action sets up can. Without it, the build fails with
+      # "Cache export is not supported for the docker driver."
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
