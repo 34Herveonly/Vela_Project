@@ -1,0 +1,9 @@
+# Never commit these
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+.terraform/
+terraform.tfvars
+*.json
+crash.log
+
