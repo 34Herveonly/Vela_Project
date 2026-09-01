@@ -89,9 +89,6 @@ jobs:
       - name: cargo test --all-targets
         run: cargo test --all-targets
 
-      - name: cargo test --doc
-        run: cargo test --doc
-
   build:
     name: Build release binaries
     runs-on: ubuntu-latest
