@@ -1,0 +1,156 @@
+---
+# Vela Production Server Configuration Playbook
+# Configures a fresh Ubuntu 22.04 server to run Vela
+# Run with: ansible-playbook -i inventory.yml playbook.yml
+
+- name: Configure Vela Production Server
+  hosts: all
+  become: true  # run as sudo where needed
+  vars:
+    vela_user: devops_admin
+    vela_config_dir: /etc/vela
+    vela_log_dir: /var/log/vela
+    vela_image: ghcr.io/34herveonly/vela_project:latest
+    vela_api_port: 7700
+
+  tasks:
+
+    # ── System updates ─────────────────────────────────────────────
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - python3-pip
+        state: present
+
+    # ── Docker installation ────────────────────────────────────────
+    - name: Create Docker keyring directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker GPG key
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+        gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker repository
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) \
+        signed-by=/etc/apt/keyrings/docker.gpg] \
+        https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" | \
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add vela user to docker group
+      user:
+        name: "{{ vela_user }}"
+        groups: docker
+        append: yes
+
+    # ── Vela directory setup ───────────────────────────────────────
+    - name: Create Vela config directory
+      file:
+        path: "{{ vela_config_dir }}"
+        state: directory
+        owner: "{{ vela_user }}"
+        group: "{{ vela_user }}"
+        mode: '0755'
+
+    - name: Create Vela log directory
+      file:
+        path: "{{ vela_log_dir }}"
+        state: directory
+        owner: "{{ vela_user }}"
+        group: "{{ vela_user }}"
+        mode: '0755'
+
+    # ── Deploy Vela config ─────────────────────────────────────────
+    - name: Copy Vela config to server
+      copy:
+        src: config.toml
+        dest: "{{ vela_config_dir }}/config.toml"
+        owner: "{{ vela_user }}"
+        group: "{{ vela_user }}"
+        mode: '0644'
+
+    # ── Pull and start Vela container ──────────────────────────────
+    - name: Pull latest Vela Docker image
+      community.docker.docker_image:
+        name: "{{ vela_image }}"
+        source: pull
+        force_source: yes
+
+    - name: Stop existing Vela container if running
+      community.docker.docker_container:
+        name: vela
+        state: absent
+      ignore_errors: yes
+
+    - name: Start Vela container
+      community.docker.docker_container:
+        name: vela
+        image: "{{ vela_image }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host
+        volumes:
+          - "{{ vela_config_dir }}/config.toml:/etc/vela/config.toml:ro"
+          - "/var/run/docker.sock:/var/run/docker.sock"
+          - "{{ vela_log_dir }}:/var/log/vela"
+        env:
+          RUST_LOG: "info"
+        groups:
+          - "{{ ansible_facts['getent_group']['docker'][1] }}"
+
+    # ── Verify deployment ──────────────────────────────────────────
+    - name: Wait for Vela to start
+      wait_for:
+        port: "{{ vela_api_port }}"
+        host: 127.0.0.1
+        delay: 5
+        timeout: 30
+
+    - name: Verify Vela health endpoint responds
+      uri:
+        url: "http://127.0.0.1:{{ vela_api_port }}/health"
+        method: GET
+        status_code: 200
+      register: health_check
+
+    - name: Show health check result
+      debug:
+        msg: "Vela is live — health endpoint returned: {{ health_check.json }}"
