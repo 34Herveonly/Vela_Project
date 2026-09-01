@@ -1,5 +1,9 @@
 # Vela
 
+![CI](https://github.com/34Herveonly/Vela_Project/actions/workflows/ci.yml/badge.svg)
+
+> **Status:** v0.1.0 — production ready. Deployed automatically on merge to main.
+
 A single-binary service health orchestrator for lean Linux deployments.
 
 Drop one binary on any Linux server. Vela watches your services,
@@ -316,18 +320,24 @@ coherent as multiple contributors (and AI agents) work on it.
 
 ## Build status
 
-| Phase | Status |
+| Feature | Status |
 |---|---|
-| Phase 1 — Config engine + models | Done |
-| Phase 2 — Health engine | Done |
-| Phase 3 — Recovery engine | Done |
-| Phase 4 — Alert engine | Done |
-| Phase 5 — Proxy engine | Done |
-| Phase 6 — API engine | Done |
-| Phase 7 — CLI (`vela-ctl`) + web dashboard | Done |
-| Phase 8 — Docker engine, multi-upstream failover, smart recovery | Done |
+| Phase 1 — Config engine + models | ✅ Complete |
+| Phase 2 — Health engine | ✅ Complete |
+| Phase 3 — Recovery engine | ✅ Complete |
+| Phase 4 — Alert engine | ✅ Complete |
+| Phase 5 — Proxy engine | ✅ Complete |
+| Phase 6 — API engine | ✅ Complete |
+| Phase 7 — CLI + Dashboard | ✅ Complete |
+| Phase 8 — Docker + Multi-upstream | ✅ Complete |
+| CI Pipeline | ✅ Complete |
+| CD Pipeline | ✅ Complete |
+| Terraform (GCP) | 🔄 Planned |
+| Ansible (server config) | 🔄 Planned |
 
-v0.1.0 — all seven engines, the CLI, and the dashboard implemented and wired together.
+v0.1.0 — all seven engines, the CLI, and the dashboard implemented and wired
+together, with CI/CD automated end to end. See [ROADMAP.md](ROADMAP.md) for
+what's planned beyond v0.1.0.
 
 ## License
 
